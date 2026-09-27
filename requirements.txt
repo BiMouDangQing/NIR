@@ -1,0 +1,7 @@
+pyarrow>=25.0.0
+pandas>=3.0.0
+numpy>=2.5.0
+PySide6>=6.11.0
+# torch 建议用 CPU 版安装（体积更小）：
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch>=2.14.0

@@ -1,0 +1,51 @@
+# 改动日志
+
+## 2026-09-27
+
+- 【环境】创建虚拟环境 `NIR-Pyruspyrifolia`（Python 3.14.6），安装 `pyarrow 25.0.1`、`pandas 3.0.6`、`numpy 2.5.3`
+- 【功能】新增 `tools/data_loader.py`：parquet 识别与解析（`is_parquet` / `read_parquet` / `read_parquet_schema` / `read_parquet_metadata` / `load_spectra` / `to_numpy`）
+- 【配置】新增 `config/settings.py`、`config/__init__.py`：项目根目录、数据目录、默认读取引擎
+- 【入口】新增 `main.py`：命令行识别并解析 parquet 文件
+- 【依赖】新增 `requirements.txt`
+- 【验证】生成 `data/sample.parquet` 样例并端到端验证解析通过
+- 【前端】新增 `QT/theme.py`、`QT/main_window.py`：「秋月梨」主题 PySide6 界面（logo + 文件选择 + 信息展示 + 数据预览）
+- 【入口】新增 `run_ui.py`：图形界面入口
+- 【入口】新增 `NIR-Pyruspyrifolia.bat`：一键启动脚本，路径基于脚本所在目录动态计算，迁移项目后无需修改
+- 【依赖】安装 `PySide6 6.11.2`
+- 【验证】无头冒烟测试通过（加载样例数据 3 行 × 3 列）
+- 【重构】入口文件移入脚手架：`main.py` → `tools/cli.py`，`run_ui.py` → `QT/app.py`，根目录不再有代码文件
+- 【脚本】`NIR-Pyruspyrifolia.bat` 增强：虚拟环境缺失时自动创建并安装依赖（严格绑定项目路径）
+- 【依赖】`requirements.txt` 补充 `PySide6>=6.11.0`
+- 【环境】改用内置便携运行时 `runtime/`（Python 3.14.6 embeddable + 全部依赖），脱离系统 Python 与网络，支持离线迁移
+- 【脚本】`NIR-Pyruspyrifolia.bat` 改用 `runtime\python.exe`，迁移后无需安装、无需联网
+- 【脚本】`NIR-Pyruspyrifolia.bat` 注释与提示改为中英双语
+- 【脚本】`NIR-Pyruspyrifolia.bat` 编码统一为 UTF-8（无 BOM）+ CRLF（`chcp 65001`），解决编辑器与 cmd 的中文乱码
+- 【功能】新增 `tools/logger.py`：运行日志（`log/app.log` 滚动）+ 崩溃日志（`log/crash_*.log`），GUI 安装全局异常钩子
+- 【功能】新增 `config/memory.py`：配置记忆（JSON 持久化窗口位置与上次打开路径），GUI 启动恢复、关闭保存
+- 【脚本】`NIR-Pyruspyrifolia.bat` 改用 `pythonw.exe` 无窗口分离启动，启动后立即关闭命令窗口
+- 【前端】`QT/main_window.py` 增加表格缩放（放大/缩小/重置按钮 + Ctrl 滚轮）与列宽拖拽，新增 CSV 导出
+- 【修复】启动时窗口先显示、上次文件延迟加载，大文件预览限前 1000 行，避免启动假死
+- 【修复】日志控制台编码改为 UTF-8，修复路径含不间断空格时的编码报错
+- 【功能】加入单实例保护，防止重复启动多窗口
+- 【功能】日志改为按天生成（`log/app_YYYY-MM-DD.log`，每天一个，保留最近 30 天）
+- 【功能】新增 `tools/cluster_baseline.py`：NIR 无监督聚类基线（解析光谱→SNV→PCA→KMeans，numpy 实现无额外依赖）
+- 【功能】新增 `tools/autoencoder.py`：1024 维 NIR 光谱自编码器（无监督重建/深度曲线拟合），支持特征提取与异常检测
+- 【依赖】安装 `torch 2.14.0+cpu`（runtime 增至约 1.5 GB）
+- 【前端】主窗口改为「数据预览/模型训练/模型预测」三个页签，训练支持训练比例划分，路径下拉框记忆最近 5 次
+- 【后端】`tools/autoencoder.py` 重构为可复用服务（`run_training`/`run_prediction`，支持 GPU/CPU 自动切换），新增 `QT/worker.py` 后台任务线程
+- 【架构】新增 `model/` 算法包（autoencoder/reduce/anomaly/service），自监督预训练、特征学习、降维、异常检测统一框架
+- 【前端】新增「降维可视化」页签（PCA 2D 散点图 + 异常高亮，QtCharts）
+- 【前端】「模型训练」页签更名为「自监督预训练」，新增瓶颈维度参数；新增「帮助」页签（功能与配置参数说明）
+- 【清理】移除虚拟环境 `NIR-Pyruspyrifolia/`（由便携运行时取代）
+- 【文档】新增 `md/环境配置手册.md`、`md/NIR-Pyruspyrifolia.md`
+- 【前端】训练页签新增「训练设备」下拉框（自动 / CPU / GPU），`get_device` 支持显式指定设备
+- 【前端】训练完成后自动绘制「训练损失曲线」（训练/验证 MSE，QtCharts QLineSeries）
+- 【功能】新增 `model/preprocess.py`：光谱预处理（SNV / MSC / S-G 平滑 / 一二阶导数），训练前可选启用
+- 【修复】`model/preprocess.py` S-G 平滑卷积核错误（此前误用多项式系数作核），改为 `A @ coeffs` 还原为 7 点平滑核
+- 【功能】新增 `model/outlier.py`：训练前离群剔除（SNV → PCA → KMeans → 簇内距离分位数），可选启用
+- 【前端】训练页签新增「离群点剔除」开关组（启用 + 聚类数 + 剔除分位）
+- 【功能】离群剔除新增「自动选 k」（轮廓系数遍历 2~8 自动选最优聚类数）
+- 【修复】路径记忆下拉框：选择路径后未加入下拉列表，已改为 `_remember_path` 统一写入并即时更新
+- 【文档】新增 `README.md`（项目说明）
+- 【文档】新增 `md/数据预处理.md`（预处理与离群剔除说明）
+- 【前端】训练页签新增预处理开关组与「暂停/继续训练」按钮（threading.Event 实现，epoch 间阻塞）
