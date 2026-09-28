@@ -8,6 +8,10 @@ data/
 # 训练输出
 model_output/
 
+# 微调输出与预测结果（运行产物）
+finetune_output/
+predict/
+
 # 运行日志
 log/
 

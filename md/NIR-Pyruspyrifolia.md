@@ -1,55 +1,33 @@
 # NIR-Pyruspyrifolia 项目设计文档
 
-项目定位：梨（*Pyrus pyrifolia*）近红外（NIR）光谱数据处理项目。核心需求：识别并解析 `.parquet` 格式的光谱数据文件。
+项目定位：梨（*Pyrus pyrifolia*）近红外（NIR）光谱数据处理项目。核心能力：解析
+`.parquet` 光谱数据，进行**无监督自编码器建模**（特征学习、异常检测、降维可视化）
+与**有监督微调**（用真实标签预测糖度等指标）。
+
+## 📚 文档导航
+
+| 文档 | 内容 |
+| --- | --- |
+| [项目结构](项目结构.md) | 目录结构、模块职责、调用关系、六个页签 |
+| [无监督学习](无监督学习.md) | 自编码器原理、公式、异常检测、PCA、参数含义 |
+| [数据预处理](数据预处理.md) | SNV/MSC/S-G/导数与离群剔除的公式与参数 |
+| [模型微调](模型微调.md) | 有监督微调原理、公式、评估指标、预测评估 |
+| [模型训练日志](模型训练日志.md) | 每次训练/微调的参数、结果、分析与建议 |
+| [算法与数据流](算法与数据流.md) | 字段含义、端到端数据流全景 |
+| [环境配置手册](环境配置手册.md) | 运行时、依赖、启动、GPU 配置 |
+| [CHANGELOG](CHANGELOG.md) | 改动日志 |
 
 ## 1. 目录结构与职责划分
 
 | 目录 | 职责 | 对应代码 |
 | --- | --- | --- |
-| `config/` | 全局配置（路径、波段、模型参数） | `config/settings.py` |
-| `tools/` | 核心工具库（parquet 解析、光谱处理） | `tools/data_loader.py` 等 |
-| `QT/` | 图形界面（调用 tools 的功能） | `QT/main_window.py` 等 |
+| `config/` | 全局配置（路径、配置记忆） | `config/settings.py`、`config/memory.py` |
+| `model/` | 算法核心（自编码器/预处理/离群/降维/异常/微调/编排） | `model/*.py` |
+| `QT/` | 图形界面（6 页签） | `QT/main_window.py` 等 |
+| `tools/` | 工具库（parquet 解析、xlsx 转换、日志、CLI） | `tools/*.py` |
 | `md/` | 项目文档 | 本目录 |
 
-目录树：
-
-```
-NIR-Pyruspyrifolia/
-├── config/
-│   ├── __init__.py
-│   ├── settings.py          # 数据目录、默认参数、日志/配置路径
-│   └── memory.py            # 配置记忆（JSON 持久化）
-├── model/
-│   ├── __init__.py
-│   ├── autoencoder.py       # 自编码器（自监督预训练/特征学习）
-│   ├── preprocess.py        # 光谱预处理（SNV / MSC / 平滑 / 导数）
-│   ├── outlier.py           # 离群剔除（训练前聚类）
-│   ├── reduce.py            # 降维（PCA）
-│   ├── anomaly.py           # 异常检测
-│   └── service.py           # 高层编排（训练/预测/可视化）
-├── tools/
-│   ├── __init__.py
-│   ├── data_loader.py       # parquet 识别与解析
-│   ├── logger.py            # 运行日志 + 崩溃日志
-│   ├── cli.py               # 命令行入口
-│   ├── cluster_baseline.py  # 无监督聚类基线
-│   └── autoencoder.py       # 训练 CLI（调用 model.service）
-├── QT/
-│   ├── __init__.py
-│   ├── theme.py             # 秋月梨主题 QSS
-│   ├── main_window.py       # 主窗口（5 页签）
-│   ├── worker.py            # 后台任务线程
-│   └── app.py               # 图形界面入口
-├── data/                    # 数据目录
-├── log/                     # 运行日志、崩溃日志（运行时生成）
-├── md/
-│   ├── 环境配置手册.md
-│   ├── NIR-Pyruspyrifolia.md
-│   └── CHANGELOG.md
-├── NIR-Pyruspyrifolia.bat   # 一键启动脚本（双击即可）
-├── requirements.txt
-└── runtime/                 # 便携 Python 运行时（含全部依赖）
-```
+完整目录树与模块职责见 [项目结构](项目结构.md)。
 
 ## 2. 功能模块：parquet 解析（tools/data_loader.py）
 

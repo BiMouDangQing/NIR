@@ -6,7 +6,7 @@
 import logging
 import sys
 
-from PySide6.QtCore import QLockFile
+from PySide6.QtCore import QLockFile, Qt
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from config.settings import CONFIG_FILE, LOG_DIR
@@ -19,6 +19,13 @@ logger = logging.getLogger("NIR.app")
 def main() -> None:
     root_logger = setup_logging(LOG_DIR)
     install_excepthook(root_logger, LOG_DIR)
+
+    # 高 DPI 适配：保留非整数缩放比例（如 125%/150%），避免 Windows 高分辨率屏
+    # 幕下窗口最大化/全屏时控件与文字被舍入缩放而模糊失真。
+    if hasattr(Qt, "HighDpiScaleFactorRoundingPolicy"):
+        QApplication.setHighDpiScaleFactorRoundingPolicy(
+            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+        )
 
     app = QApplication(sys.argv)
 

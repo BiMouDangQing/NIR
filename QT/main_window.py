@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QSpinBox,
     QTabWidget,
@@ -34,12 +35,22 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from PySide6.QtCharts import QChart, QChartView, QLineSeries, QScatterSeries
+from PySide6.QtCharts import (
+    QBarCategoryAxis,
+    QBarSeries,
+    QBarSet,
+    QChart,
+    QChartView,
+    QLineSeries,
+    QScatterSeries,
+    QValueAxis,
+)
 
 from config.memory import AppMemory
 from config.settings import CONFIG_FILE
-from model.service import run_prediction, run_training, run_visualize
+from model.service import FINETUNE_DIR, run_finetune, run_finetune_predict, run_prediction, run_training, run_visualize
 from QT.theme import QIYUE_THEME
+from QT.pointcloud_3d import PointCloud3DWidget
 from QT.worker import ModelWorker
 from tools import is_parquet, load_spectra, read_parquet_metadata
 
@@ -70,8 +81,9 @@ _HELP_TEXT = """\
 | 页签 | 功能 |
 | --- | --- |
 | 数据预览 | 打开 parquet、表格预览、缩放、导出 CSV |
-| 自监督预训练 | 训练 / 更新自编码器模型，绘制损失曲线，支持暂停 |
+| 自监督预训练 | 训练 / 更新自编码器模型，实时进度条 + 损失曲线，支持暂停 |
 | 模型预测 | 用已训练模型做异常检测，输出重构误差 |
+| 模型微调 | 用有标签数据微调回归头，预测指定指标（需提供真实标签） |
 | 降维可视化 | 瓶颈特征 PCA 到 2D 散点图 |
 | 帮助 | 本页面 |
 
@@ -170,6 +182,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_preview_tab(), "数据预览")
         self.tabs.addTab(self._build_train_tab(), "自监督预训练")
         self.tabs.addTab(self._build_predict_tab(), "模型预测")
+        self.tabs.addTab(self._build_finetune_tab(), "模型微调")
         self.tabs.addTab(self._build_visualize_tab(), "降维可视化")
         self.tabs.addTab(self._build_help_tab(), "帮助")
         root.addWidget(self.tabs, 1)
@@ -287,8 +300,13 @@ class MainWindow(QMainWindow):
         form.setSpacing(10)
         self.train_data_combo, data_row = self._path_row("recent_train_data", "file")
         form.addRow("数据文件:", data_row)
-        self.train_out_combo, out_row = self._path_row("recent_model_dir", "dir")
+        self.train_out_combo, out_row = self._path_row("recent_train_out_dir", "dir")
         form.addRow("模型输出目录:", out_row)
+
+        self.spectrum_combo = QComboBox()
+        self.spectrum_combo.addItem("SpectrumData（1024 维原始光谱）", "SpectrumData")
+        self.spectrum_combo.addItem("Abs（301 维吸光度）", "Abs")
+        form.addRow("光谱字段:", self.spectrum_combo)
 
         self.ratio_spin = QSpinBox()
         self.ratio_spin.setRange(10, 90)
@@ -349,9 +367,11 @@ class MainWindow(QMainWindow):
         self.outlier_k_spin = QSpinBox()
         self.outlier_k_spin.setRange(2, 20)
         self.outlier_k_spin.setValue(5)
-        self.outlier_pct_spin = QSpinBox()
-        self.outlier_pct_spin.setRange(90, 100)
-        self.outlier_pct_spin.setValue(99)
+        self.outlier_pct_spin = QDoubleSpinBox()
+        self.outlier_pct_spin.setRange(90.0, 100.0)
+        self.outlier_pct_spin.setDecimals(2)
+        self.outlier_pct_spin.setSingleStep(0.05)
+        self.outlier_pct_spin.setValue(99.0)
         self.outlier_pct_spin.setSuffix(" %")
         self.outlier_auto_cb = QCheckBox("自动选 k")
         self.outlier_auto_cb.toggled.connect(self.outlier_k_spin.setDisabled)
@@ -365,16 +385,22 @@ class MainWindow(QMainWindow):
         layout.addWidget(outlier_box)
 
         btn_row = QHBoxLayout()
-        train_btn = QPushButton("开始训练")
-        train_btn.clicked.connect(self._start_train)
+        self.train_btn = QPushButton("开始训练")
+        self.train_btn.clicked.connect(self._start_train)
         self.pause_btn = QPushButton("暂停训练")
         self.pause_btn.setCheckable(True)
         self.pause_btn.setEnabled(False)
         self.pause_btn.toggled.connect(self._toggle_pause)
-        btn_row.addWidget(train_btn)
+        btn_row.addWidget(self.train_btn)
         btn_row.addWidget(self.pause_btn)
         btn_row.addStretch()
         layout.addLayout(btn_row)
+
+        self.train_progress = QProgressBar()
+        self.train_progress.setRange(0, 1)
+        self.train_progress.setValue(0)
+        self.train_progress.setFormat("就绪")
+        layout.addWidget(self.train_progress)
 
         self.train_chart = QChart()
         self.train_chart.setTitle("训练损失曲线")
@@ -396,17 +422,25 @@ class MainWindow(QMainWindow):
 
         form = QFormLayout()
         form.setSpacing(10)
-        self.pred_model_combo, model_row = self._path_row("recent_model_dir", "dir")
+        self.pred_model_combo, model_row = self._path_row("recent_pred_model_dir", "dir")
         form.addRow("模型目录:", model_row)
         self.pred_data_combo, data_row = self._path_row("recent_predict_data", "file")
         form.addRow("数据文件:", data_row)
-        self.pred_out_combo, out_row = self._path_row("recent_predict_out", "save")
-        form.addRow("结果 CSV:", out_row)
         layout.addLayout(form)
 
         pred_btn = QPushButton("开始预测")
         pred_btn.clicked.connect(self._start_predict)
         layout.addWidget(pred_btn)
+
+        self.pred_metric = QLabel("尚未预测")
+        self.pred_metric.setWordWrap(True)
+        layout.addWidget(self.pred_metric)
+
+        self.pred_chart = QChart()
+        self.pred_chart.setTitle("重构误差分布")
+        self.pred_chart_view = QChartView(self.pred_chart)
+        self.pred_chart_view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        layout.addWidget(self.pred_chart_view, 1)
 
         self.pred_log = QPlainTextEdit()
         self.pred_log.setReadOnly(True)
@@ -414,8 +448,179 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.pred_log, 1)
         return tab
 
+    def _build_finetune_tab(self) -> QWidget:
+        tabs = QTabWidget()
+
+        train_tab = QWidget()
+        layout = QVBoxLayout(train_tab)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(12)
+
+        form = QFormLayout()
+        form.setSpacing(10)
+        self.ft_data_combo, data_row = self._path_row("recent_finetune_data", "file")
+        form.addRow("数据文件:", data_row)
+        self.ft_model_combo, model_row = self._path_row("recent_ft_pretrain_dir", "dir")
+        form.addRow("预训练模型:", model_row)
+        self.ft_out_combo, out_row = self._path_row("recent_finetune_dir", "dir")
+        if not self.ft_out_combo.currentText().strip():
+            self.ft_out_combo.setCurrentText(str(FINETUNE_DIR))
+        form.addRow("微调输出目录:", out_row)
+
+        label_row = QWidget()
+        label_h = QHBoxLayout(label_row)
+        label_h.setContentsMargins(0, 0, 0, 0)
+        label_h.setSpacing(6)
+        self.ft_label_combo = QComboBox()
+        self.ft_label_combo.setEditable(True)
+        self.ft_label_combo.addItem("RealValue", "RealValue")
+        self.ft_label_combo.addItem("PredictedValue", "PredictedValue")
+        self.ft_label_combo.addItem("Diameter", "Diameter")
+        self.ft_label_index_spin = QSpinBox()
+        self.ft_label_index_spin.setRange(1, 10)
+        self.ft_label_index_spin.setValue(1)
+        label_h.addWidget(self.ft_label_combo, 1)
+        label_h.addWidget(QLabel("第"))
+        label_h.addWidget(self.ft_label_index_spin)
+        label_h.addWidget(QLabel("分量"))
+        form.addRow("标签字段:", label_row)
+
+        self.ft_epochs_spin = QSpinBox()
+        self.ft_epochs_spin.setRange(1, 1000)
+        self.ft_epochs_spin.setValue(100)
+        form.addRow("训练轮数:", self.ft_epochs_spin)
+
+        self.ft_batch_spin = QSpinBox()
+        self.ft_batch_spin.setRange(16, 4096)
+        self.ft_batch_spin.setValue(64)
+        form.addRow("批大小:", self.ft_batch_spin)
+
+        self.ft_lr_spin = QDoubleSpinBox()
+        self.ft_lr_spin.setRange(0.00001, 1.0)
+        self.ft_lr_spin.setDecimals(5)
+        self.ft_lr_spin.setSingleStep(0.0001)
+        self.ft_lr_spin.setValue(0.001)
+        form.addRow("学习率:", self.ft_lr_spin)
+
+        self.ft_ratio_spin = QSpinBox()
+        self.ft_ratio_spin.setRange(10, 90)
+        self.ft_ratio_spin.setValue(80)
+        self.ft_ratio_spin.setSuffix(" %")
+        form.addRow("训练比例:", self.ft_ratio_spin)
+
+        self.ft_max_samples_spin = QSpinBox()
+        self.ft_max_samples_spin.setRange(0, 24462)
+        self.ft_max_samples_spin.setValue(0)
+        self.ft_max_samples_spin.setSingleStep(100)
+        self.ft_max_samples_spin.setSpecialValueText("全部")
+        self.ft_max_samples_spin.setSuffix(" 个（0=全部）")
+        form.addRow("微调样本数:", self.ft_max_samples_spin)
+
+        self.ft_cv_spin = QSpinBox()
+        self.ft_cv_spin.setRange(0, 10)
+        self.ft_cv_spin.setValue(5)
+        self.ft_cv_spin.setSpecialValueText("关闭")
+        self.ft_cv_spin.setSuffix(" 折")
+        form.addRow("交叉验证折数:", self.ft_cv_spin)
+
+        self.ft_device_combo = QComboBox()
+        self.ft_device_combo.addItem("自动检测", None)
+        self.ft_device_combo.addItem("CPU", "cpu")
+        self.ft_device_combo.addItem("GPU (CUDA)", "cuda")
+        form.addRow("训练设备:", self.ft_device_combo)
+        layout.addLayout(form)
+
+        self.ft_freeze_cb = QCheckBox("冻结编码器（先只训回归头）")
+        self.ft_freeze_cb.setChecked(True)
+        self.ft_unfreeze_spin = QSpinBox()
+        self.ft_unfreeze_spin.setRange(0, 500)
+        self.ft_unfreeze_spin.setValue(30)
+        self.ft_unfreeze_spin.setSpecialValueText("0=纯冻结")
+        self.ft_unfreeze_spin.setSuffix(" 轮解冻联合微调")
+        freeze_row = QWidget()
+        freeze_h = QHBoxLayout(freeze_row)
+        freeze_h.setContentsMargins(0, 0, 0, 0)
+        freeze_h.setSpacing(6)
+        freeze_h.addWidget(self.ft_freeze_cb)
+        freeze_h.addWidget(QLabel("最后"))
+        freeze_h.addWidget(self.ft_unfreeze_spin)
+        freeze_h.addStretch()
+        layout.addWidget(freeze_row)
+
+        btn_row = QHBoxLayout()
+        self.finetune_btn = QPushButton("开始微调")
+        self.finetune_btn.clicked.connect(self._start_finetune)
+        self.ft_pause_btn = QPushButton("暂停微调")
+        self.ft_pause_btn.setCheckable(True)
+        self.ft_pause_btn.setEnabled(False)
+        self.ft_pause_btn.toggled.connect(self._toggle_finetune_pause)
+        btn_row.addWidget(self.finetune_btn)
+        btn_row.addWidget(self.ft_pause_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        self.ft_progress = QProgressBar()
+        self.ft_progress.setRange(0, 1)
+        self.ft_progress.setValue(0)
+        self.ft_progress.setFormat("就绪")
+        layout.addWidget(self.ft_progress)
+
+        self.ft_chart = QChart()
+        self.ft_chart.setTitle("微调损失曲线")
+        self.ft_chart_view = QChartView(self.ft_chart)
+        self.ft_chart_view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        layout.addWidget(self.ft_chart_view, 1)
+
+        self.ft_result = QLabel("尚未微调")
+        self.ft_result.setWordWrap(True)
+        layout.addWidget(self.ft_result)
+
+        self.ft_log = QPlainTextEdit()
+        self.ft_log.setReadOnly(True)
+        self.ft_log.setPlaceholderText("微调日志将显示在这里...")
+        layout.addWidget(self.ft_log, 1)
+        tabs.addTab(train_tab, "模型微调")
+
+        eval_tab = QWidget()
+        eval_layout = QVBoxLayout(eval_tab)
+        eval_layout.setContentsMargins(20, 16, 20, 16)
+        eval_layout.setSpacing(12)
+        eval_form = QFormLayout()
+        self.ft_eval_model_combo, em_row = self._path_row("recent_finetune_model", "dir")
+        eval_form.addRow("微调模型目录:", em_row)
+        self.ft_eval_data_combo, ed_row = self._path_row("recent_ft_eval_data", "file")
+        eval_form.addRow("数据文件:", ed_row)
+        eval_layout.addLayout(eval_form)
+        self.eval_btn = QPushButton("预测并评估")
+        self.eval_btn.clicked.connect(self._start_ft_eval)
+        eval_layout.addWidget(self.eval_btn)
+        self.ft_eval_metric = QLabel("尚未评估")
+        self.ft_eval_metric.setWordWrap(True)
+        eval_layout.addWidget(self.ft_eval_metric)
+        self.ft_eval_tabs = QTabWidget()
+        self.ft_eval_scatter_chart = QChart()
+        self.ft_eval_scatter_view = QChartView(self.ft_eval_scatter_chart)
+        self.ft_eval_scatter_view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.ft_eval_resid_chart = QChart()
+        self.ft_eval_resid_view = QChartView(self.ft_eval_resid_chart)
+        self.ft_eval_resid_view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.ft_eval_hist_chart = QChart()
+        self.ft_eval_hist_view = QChartView(self.ft_eval_hist_chart)
+        self.ft_eval_hist_view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.ft_eval_tabs.addTab(self.ft_eval_scatter_view, "预测 vs 真实")
+        self.ft_eval_tabs.addTab(self.ft_eval_resid_view, "残差图")
+        self.ft_eval_tabs.addTab(self.ft_eval_hist_view, "误差分布")
+        eval_layout.addWidget(self.ft_eval_tabs, 1)
+        tabs.addTab(eval_tab, "预测评估")
+
+        return tabs
+
     # ---------- 训练 / 预测 ----------
     def _start_train(self) -> None:
+        worker = getattr(self, "_train_worker", None)
+        if worker is not None and worker.isRunning():
+            QMessageBox.warning(self, "提示", "训练正在进行中，请等待完成后再试。")
+            return
         data = self.train_data_combo.currentText().strip()
         out = self.train_out_combo.currentText().strip()
         if not data:
@@ -425,7 +630,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请选择模型输出目录")
             return
         self._remember_path(self.train_data_combo, "recent_train_data", data)
-        self._remember_path(self.train_out_combo, "recent_model_dir", out)
+        self._remember_path(self.train_out_combo, "recent_train_out_dir", out)
 
         self.train_log.clear()
         self.train_log.appendPlainText(f"开始训练：{data}\n")
@@ -447,6 +652,11 @@ class MainWindow(QMainWindow):
         self.pause_btn.setChecked(False)
         self.pause_btn.setEnabled(True)
         self.pause_btn.setText("暂停训练")
+        self.train_btn.setEnabled(False)
+
+        self.train_progress.setRange(0, self.epochs_spin.value())
+        self.train_progress.setValue(0)
+        self._init_train_chart()
 
         self._train_worker = ModelWorker(
             run_training,
@@ -460,8 +670,10 @@ class MainWindow(QMainWindow):
             device=self.device_combo.currentData(),
             preprocess=preprocess,
             remove_outliers=remove_outliers,
+            spectrum_column=self.spectrum_combo.currentData(),
         )
         self._train_worker.log_signal.connect(self.train_log.appendPlainText)
+        self._train_worker.epoch_signal.connect(self._on_train_epoch)
         self._train_worker.done_signal.connect(self._on_train_done)
         self._train_worker.error_signal.connect(self._on_task_error)
         self._train_worker.start()
@@ -470,6 +682,9 @@ class MainWindow(QMainWindow):
         self.pause_btn.setChecked(False)
         self.pause_btn.setEnabled(False)
         self.pause_btn.setText("暂停训练")
+        self.train_btn.setEnabled(True)
+        self.train_progress.setValue(self.train_progress.maximum())
+        self.train_progress.setFormat("完成")
         brief = {k: v for k, v in summary.items() if k != "history"}
         self.train_log.appendPlainText(f"\n训练完成：{brief}\n")
         self._plot_train_history(summary.get("history"))
@@ -523,22 +738,52 @@ class MainWindow(QMainWindow):
             y_axes[0].setTitleText("MSE 损失")
         self.train_chart_view.setChart(chart)
 
+    def _init_train_chart(self) -> None:
+        """训练开始时初始化空曲线，用于逐 epoch 实时更新。"""
+        chart = QChart()
+        chart.setTitle("训练损失曲线")
+        self._train_series = QLineSeries()
+        self._train_series.setName("训练损失")
+        self._train_series.setColor(QColor("#D8A24A"))
+        self._val_series = QLineSeries()
+        self._val_series.setName("验证损失")
+        self._val_series.setColor(QColor("#4A90D8"))
+        chart.addSeries(self._train_series)
+        chart.addSeries(self._val_series)
+        chart.createDefaultAxes()
+        self.train_chart_view.setChart(chart)
+
+    def _on_train_epoch(self, epoch: int, epochs: int, train_loss: float, val_loss, metrics=None) -> None:
+        """每个 epoch 结束实时更新进度条与损失曲线。"""
+        self.train_progress.setRange(0, epochs)
+        self.train_progress.setValue(epoch)
+        self.train_progress.setFormat(f"epoch {epoch}/{epochs}  %p%")
+
+        self._train_series.append(float(epoch), float(train_loss))
+        if val_loss is not None:
+            self._val_series.append(float(epoch), float(val_loss))
+
+        chart = self.train_chart_view.chart()
+        x_axes = chart.axes(Qt.Orientation.Horizontal)
+        y_axes = chart.axes(Qt.Orientation.Vertical)
+        if x_axes:
+            x_axes[0].setRange(1, epochs)
+        if y_axes:
+            points = self._train_series.pointsVector()
+            max_y = max(p.y() for p in points) if points else 1.0
+            y_axes[0].setRange(0, max_y * 1.1)
+
     def _start_predict(self) -> None:
         model_dir = self.pred_model_combo.currentText().strip()
         data = self.pred_data_combo.currentText().strip()
-        out = self.pred_out_combo.currentText().strip()
         if not model_dir:
             QMessageBox.warning(self, "提示", "请选择模型目录")
             return
         if not data:
             QMessageBox.warning(self, "提示", "请选择数据文件")
             return
-        if not out:
-            QMessageBox.warning(self, "提示", "请选择结果 CSV 路径")
-            return
-        self._remember_path(self.pred_model_combo, "recent_model_dir", model_dir)
+        self._remember_path(self.pred_model_combo, "recent_pred_model_dir", model_dir)
         self._remember_path(self.pred_data_combo, "recent_predict_data", data)
-        self._remember_path(self.pred_out_combo, "recent_predict_out", out)
 
         self.pred_log.clear()
         self.pred_log.appendPlainText(f"开始预测：{data}\n")
@@ -546,7 +791,6 @@ class MainWindow(QMainWindow):
             run_prediction,
             data_path=data,
             model_dir=model_dir,
-            out_path=out,
         )
         self._predict_worker.log_signal.connect(self.pred_log.appendPlainText)
         self._predict_worker.done_signal.connect(self._on_predict_done)
@@ -555,14 +799,371 @@ class MainWindow(QMainWindow):
 
     def _on_predict_done(self, summary: dict) -> None:
         self.pred_log.appendPlainText(f"\n预测完成：{summary}\n")
+        self._plot_pred_histogram(summary)
+        self.pred_metric.setText(
+            f"样本 {summary['samples']} | 均值 {summary['recon_err_mean']:.4f} | "
+            f"中位数 {summary['recon_err_median']:.4f} | "
+            f"95分位 {summary['recon_err_p95']:.4f} | "
+            f"99分位 {summary['recon_err_p99']:.4f} | "
+            f"异常 {summary['anomaly_count']} 个"
+        )
         QMessageBox.information(
             self, "完成", f"预测完成，结果已保存到：\n{summary.get('out_path')}"
         )
+
+    def _plot_pred_histogram(self, summary: dict) -> None:
+        """把重构误差分布画成直方图（对数横轴）。"""
+        centers = summary.get("hist_centers") or []
+        counts = summary.get("hist_counts") or []
+        if not centers:
+            return
+        bar_set = QBarSet("样本数")
+        bar_set.setColor(QColor("#D8A24A"))
+        labels = []
+        for c, n in zip(centers, counts):
+            bar_set.append(float(n))
+            labels.append(f"{c:.2g}")
+        series = QBarSeries()
+        series.append(bar_set)
+
+        chart = QChart()
+        chart.addSeries(series)
+        chart.setTitle("重构误差分布（对数横轴，右侧为异常尾）")
+        axis_x = QBarCategoryAxis()
+        axis_x.append(labels)
+        chart.addAxis(axis_x, Qt.AlignBottom)
+        series.attachAxis(axis_x)
+        axis_y = QValueAxis()
+        axis_y.setLabelFormat("%.0f")
+        chart.addAxis(axis_y, Qt.AlignLeft)
+        series.attachAxis(axis_y)
+        self.pred_chart_view.setChart(chart)
+
+    def _start_finetune(self) -> None:
+        worker = getattr(self, "_ft_worker", None)
+        if worker is not None and worker.isRunning():
+            QMessageBox.warning(self, "提示", "微调正在进行中，请等待完成后再试。")
+            return
+        data = self.ft_data_combo.currentText().strip()
+        model_dir = self.ft_model_combo.currentText().strip()
+        out = self.ft_out_combo.currentText().strip()
+        if not data:
+            QMessageBox.warning(self, "提示", "请选择数据文件")
+            return
+        if not model_dir:
+            QMessageBox.warning(self, "提示", "请选择预训练模型目录")
+            return
+        if not out:
+            QMessageBox.warning(self, "提示", "请选择微调输出目录")
+            return
+        self._remember_path(self.ft_data_combo, "recent_finetune_data", data)
+        self._remember_path(self.ft_model_combo, "recent_ft_pretrain_dir", model_dir)
+        self._remember_path(self.ft_out_combo, "recent_finetune_dir", out)
+
+        self.ft_log.clear()
+        self.ft_log.appendPlainText(f"开始微调：{data}\n")
+
+        max_samples = self.ft_max_samples_spin.value()
+        self.ft_pause_btn.setChecked(False)
+        self.ft_pause_btn.setEnabled(True)
+        self.ft_pause_btn.setText("暂停微调")
+        self.finetune_btn.setEnabled(False)
+        self.ft_progress.setRange(0, self.ft_epochs_spin.value())
+        self.ft_progress.setValue(0)
+        self._init_finetune_chart()
+
+        self._ft_worker = ModelWorker(
+            run_finetune,
+            data_path=data,
+            model_dir=model_dir,
+            out_dir=out,
+            label_column=self.ft_label_combo.currentText().strip() or "RealValue",
+            label_index=self.ft_label_index_spin.value() - 1,
+            epochs=self.ft_epochs_spin.value(),
+            batch_size=self.ft_batch_spin.value(),
+            lr=self.ft_lr_spin.value(),
+            freeze=self.ft_freeze_cb.isChecked(),
+            unfreeze_epochs=self.ft_unfreeze_spin.value() if self.ft_freeze_cb.isChecked() else 0,
+            train_ratio=self.ft_ratio_spin.value() / 100.0,
+            max_samples=max_samples or None,
+            k_folds=self.ft_cv_spin.value(),
+            device=self.ft_device_combo.currentData(),
+        )
+        self._ft_worker.log_signal.connect(self.ft_log.appendPlainText)
+        self._ft_worker.epoch_signal.connect(self._on_finetune_epoch)
+        self._ft_worker.done_signal.connect(self._on_finetune_done)
+        self._ft_worker.error_signal.connect(self._on_finetune_error)
+        self._ft_worker.start()
+
+    def _on_finetune_done(self, summary: dict) -> None:
+        self.ft_pause_btn.setChecked(False)
+        self.ft_pause_btn.setEnabled(False)
+        self.ft_pause_btn.setText("暂停微调")
+        self.finetune_btn.setEnabled(True)
+        self.ft_progress.setValue(self.ft_progress.maximum())
+        self.ft_progress.setFormat("完成")
+        self._plot_finetune_history(summary.get("history"))
+        cv = summary.get("cv")
+        cv_text = ""
+        if cv:
+            cv_text = (
+                f"\n{cv['k']} 折交叉验证: RMSE {cv['mean']['rmse']:.4f}±{cv['std']['rmse']:.4f} | "
+                f"R² {cv['mean']['r2']:.4f}±{cv['std']['r2']:.4f} | corr {cv['mean']['corr']:.4f}±{cv['std']['corr']:.4f}"
+            )
+        self.ft_result.setText(
+            f"样本 {summary['samples']}（训练 {summary['train_samples']} / 验证 {summary['val_samples']}） | "
+            f"验证 RMSE {summary['rmse']:.4f} | MAE {summary['mae']:.4f} | R² {summary['r2']:.4f} | "
+            f"corr {summary.get('corr', 0.0):.4f} | "
+            f"{'冻结编码器' if summary['freeze'] else '全模型微调'}" + cv_text
+        )
+        QMessageBox.information(
+            self, "完成", f"微调完成，模型已保存到：\n{summary.get('out_dir')}"
+        )
+        # 自动填入评估区的微调模型目录，方便直接预测评估
+        if self.ft_eval_model_combo.count() == 0 or not self.ft_eval_model_combo.currentText().strip():
+            self.ft_eval_model_combo.setCurrentText(summary.get("out_dir", ""))
+
+    def _start_ft_eval(self) -> None:
+        worker = getattr(self, "_ft_eval_worker", None)
+        if worker is not None and worker.isRunning():
+            QMessageBox.warning(self, "提示", "预测评估正在进行中，请等待完成。")
+            return
+        model_dir = self.ft_eval_model_combo.currentText().strip()
+        data = self.ft_eval_data_combo.currentText().strip()
+        if not model_dir:
+            QMessageBox.warning(self, "提示", "请选择微调模型目录")
+            return
+        if not data:
+            QMessageBox.warning(self, "提示", "请选择数据文件")
+            return
+        self._remember_path(self.ft_eval_model_combo, "recent_finetune_model", model_dir)
+        self._remember_path(self.ft_eval_data_combo, "recent_ft_eval_data", data)
+        self.ft_eval_metric.setText("正在评估...")
+        self.eval_btn.setEnabled(False)
+        self._ft_eval_worker = ModelWorker(
+            run_finetune_predict,
+            data_path=data,
+            model_dir=model_dir,
+        )
+        self._ft_eval_worker.log_signal.connect(self.ft_log.appendPlainText)
+        self._ft_eval_worker.done_signal.connect(self._on_ft_eval_done)
+        self._ft_eval_worker.error_signal.connect(self._on_finetune_error)
+        self._ft_eval_worker.start()
+
+    def _on_ft_eval_done(self, summary: dict) -> None:
+        self.eval_btn.setEnabled(True)
+        metrics = summary.get("metrics")
+        scatters = summary.get("scatters")
+        if metrics:
+            self.ft_eval_metric.setText(
+                f"样本 {summary['samples']} | RMSE {metrics['rmse']:.4f} | MAE {metrics['mae']:.4f} | "
+                f"R² {metrics['r2']:.4f} | 相关系数 {metrics['corr']:.4f} | MAPE {metrics['mape']:.2f}% | "
+                f"偏差 {metrics['bias']:+.4f}\n"
+                f"误差: 均值 {metrics['bias']:+.4f}, 标准差 {metrics['err_std']:.4f}, "
+                f"5%~95% 区间 [{metrics['err_p5']:+.3f}, {metrics['err_p95']:+.3f}]"
+            )
+        else:
+            self.ft_eval_metric.setText(
+                f"样本 {summary['samples']} | 数据无标签列，仅输出预测值\n"
+                f"预测均值 {summary['mean']:.3f}，标准差 {summary['std']:.3f}，"
+                f"范围 [{summary['min']:.3f}, {summary['max']:.3f}]"
+            )
+        if scatters:
+            self._plot_ft_eval_scatter(scatters)
+            self._plot_ft_residual(scatters)
+            self._plot_ft_error_hist(scatters)
+        QMessageBox.information(
+            self, "完成", f"预测完成，结果已保存到：\n{summary.get('out_path')}"
+        )
+
+    def _plot_ft_eval_scatter(self, scatters: dict) -> None:
+        """预测值 vs 真实值散点图 + y=x 理想线。"""
+        y_true = scatters["y_true"]
+        y_pred = scatters["y_pred"]
+        chart = QChart()
+        chart.setTitle("预测值 vs 真实值（越接近对角线越好）")
+        series = QScatterSeries()
+        series.setName("样本")
+        series.setMarkerSize(5)
+        series.setColor(QColor("#D8A24A"))
+        for t, p in zip(y_true, y_pred):
+            series.append(float(t), float(p))
+        chart.addSeries(series)
+        lo = min(min(y_true), min(y_pred))
+        hi = max(max(y_true), max(y_pred))
+        line = QLineSeries()
+        line.setName("y=x 理想线")
+        line.setColor(QColor("#D64545"))
+        line.append(float(lo), float(lo))
+        line.append(float(hi), float(hi))
+        chart.addSeries(line)
+        chart.createDefaultAxes()
+        x_axes = chart.axes(Qt.Orientation.Horizontal)
+        y_axes = chart.axes(Qt.Orientation.Vertical)
+        if x_axes:
+            x_axes[0].setTitleText("真实值")
+        if y_axes:
+            y_axes[0].setTitleText("预测值")
+        self.ft_eval_scatter_view.setChart(chart)
+
+    def _plot_ft_residual(self, scatters: dict) -> None:
+        """残差图：误差（预测-真实）随真实值的变化，应围绕 0 随机分布。"""
+        y_true = scatters["y_true"]
+        y_pred = scatters["y_pred"]
+        chart = QChart()
+        chart.setTitle("残差图（误差 = 预测 - 真实，应围绕 0 随机分布）")
+        series = QScatterSeries()
+        series.setName("残差")
+        series.setMarkerSize(5)
+        series.setColor(QColor("#4A90D8"))
+        for t, p in zip(y_true, y_pred):
+            series.append(float(t), float(p - t))
+        chart.addSeries(series)
+        zero = QLineSeries()
+        zero.setName("零线")
+        zero.setColor(QColor("#D64545"))
+        zero.append(float(min(y_true)), 0.0)
+        zero.append(float(max(y_true)), 0.0)
+        chart.addSeries(zero)
+        chart.createDefaultAxes()
+        x_axes = chart.axes(Qt.Orientation.Horizontal)
+        y_axes = chart.axes(Qt.Orientation.Vertical)
+        if x_axes:
+            x_axes[0].setTitleText("真实值")
+        if y_axes:
+            y_axes[0].setTitleText("残差（预测-真实）")
+        self.ft_eval_resid_view.setChart(chart)
+
+    def _plot_ft_error_hist(self, scatters: dict) -> None:
+        """误差分布直方图，应近似以 0 为中心的钟形。"""
+        y_true = scatters["y_true"]
+        y_pred = scatters["y_pred"]
+        import numpy as np
+
+        errs = np.array([p - t for t, p in zip(y_true, y_pred)], dtype=float)
+        counts, edges = np.histogram(errs, bins=20)
+        bar_set = QBarSet("样本数")
+        bar_set.setColor(QColor("#D8A24A"))
+        labels = []
+        for i, c in enumerate(counts):
+            bar_set.append(float(c))
+            labels.append(f"{edges[i]:.2f}")
+        series = QBarSeries()
+        series.append(bar_set)
+        chart = QChart()
+        chart.addSeries(series)
+        chart.setTitle("误差分布（应近似以 0 为中心的钟形）")
+        axis_x = QBarCategoryAxis()
+        axis_x.append(labels)
+        chart.addAxis(axis_x, Qt.AlignBottom)
+        series.attachAxis(axis_x)
+        axis_y = QValueAxis()
+        chart.addAxis(axis_y, Qt.AlignLeft)
+        series.attachAxis(axis_y)
+        self.ft_eval_hist_view.setChart(chart)
+
+    def _toggle_finetune_pause(self, checked: bool) -> None:
+        worker = getattr(self, "_ft_worker", None)
+        if worker is None:
+            return
+        if checked:
+            worker.pause_event.set()
+            self.ft_pause_btn.setText("继续微调")
+        else:
+            worker.pause_event.clear()
+            self.ft_pause_btn.setText("暂停微调")
+
+    def _init_finetune_chart(self) -> None:
+        chart = QChart()
+        chart.setTitle("微调损失与验证 R² 曲线")
+        self._ft_train_series = QLineSeries()
+        self._ft_train_series.setName("训练损失")
+        self._ft_train_series.setColor(QColor("#D8A24A"))
+        self._ft_val_series = QLineSeries()
+        self._ft_val_series.setName("验证损失")
+        self._ft_val_series.setColor(QColor("#4A90D8"))
+        self._ft_val_r2_series = QLineSeries()
+        self._ft_val_r2_series.setName("验证 R²")
+        self._ft_val_r2_series.setColor(QColor("#3BA776"))
+        chart.addSeries(self._ft_train_series)
+        chart.addSeries(self._ft_val_series)
+        chart.addSeries(self._ft_val_r2_series)
+        self._ft_axis_x = QValueAxis()
+        self._ft_axis_x.setTitleText("训练轮数")
+        self._ft_axis_loss = QValueAxis()
+        self._ft_axis_loss.setTitleText("MSE 损失")
+        self._ft_axis_r2 = QValueAxis()
+        self._ft_axis_r2.setTitleText("验证 R²")
+        chart.addAxis(self._ft_axis_x, Qt.AlignBottom)
+        chart.addAxis(self._ft_axis_loss, Qt.AlignLeft)
+        chart.addAxis(self._ft_axis_r2, Qt.AlignRight)
+        self._ft_train_series.attachAxis(self._ft_axis_x)
+        self._ft_val_series.attachAxis(self._ft_axis_x)
+        self._ft_val_r2_series.attachAxis(self._ft_axis_x)
+        self._ft_train_series.attachAxis(self._ft_axis_loss)
+        self._ft_val_series.attachAxis(self._ft_axis_loss)
+        self._ft_val_r2_series.attachAxis(self._ft_axis_r2)
+        self.ft_chart_view.setChart(chart)
+
+    def _on_finetune_epoch(self, epoch: int, epochs: int, train_loss: float, val_loss, metrics=None) -> None:
+        self.ft_progress.setRange(0, epochs)
+        self.ft_progress.setValue(epoch)
+        self.ft_progress.setFormat(f"epoch {epoch}/{epochs}  %p%")
+        self._ft_train_series.append(float(epoch), float(train_loss))
+        if val_loss is not None:
+            self._ft_val_series.append(float(epoch), float(val_loss))
+        if metrics is not None:
+            self._ft_val_r2_series.append(float(epoch), float(metrics.get("r2", 0.0)))
+        self._ft_axis_x.setRange(1, epochs)
+        train_pts = self._ft_train_series.pointsVector()
+        if train_pts:
+            self._ft_axis_loss.setRange(0, max(p.y() for p in train_pts) * 1.1)
+        r2_pts = self._ft_val_r2_series.pointsVector()
+        if r2_pts:
+            vals = [p.y() for p in r2_pts]
+            self._ft_axis_r2.setRange(min(0.0, min(vals)) - 0.05, max(1.0, max(vals)) + 0.05)
+
+    def _plot_finetune_history(self, history: dict | None) -> None:
+        if not history:
+            return
+        train_vals = history.get("train") or []
+        val_vals = history.get("val") or []
+        chart = QChart()
+        chart.setTitle("微调损失曲线")
+        train_series = QLineSeries()
+        train_series.setName("训练损失")
+        train_series.setColor(QColor("#D8A24A"))
+        for i, v in enumerate(train_vals, 1):
+            train_series.append(float(i), float(v))
+        chart.addSeries(train_series)
+        if val_vals:
+            val_series = QLineSeries()
+            val_series.setName("验证损失")
+            val_series.setColor(QColor("#4A90D8"))
+            for i, v in enumerate(val_vals, 1):
+                val_series.append(float(i), float(v))
+            chart.addSeries(val_series)
+        chart.createDefaultAxes()
+        x_axes = chart.axes(Qt.Orientation.Horizontal)
+        y_axes = chart.axes(Qt.Orientation.Vertical)
+        if x_axes:
+            x_axes[0].setTitleText("训练轮数")
+        if y_axes:
+            y_axes[0].setTitleText("MSE 损失")
+        self.ft_chart_view.setChart(chart)
+
+    def _on_finetune_error(self, msg: str) -> None:
+        self.ft_pause_btn.setChecked(False)
+        self.ft_pause_btn.setEnabled(False)
+        self.ft_pause_btn.setText("暂停微调")
+        self.finetune_btn.setEnabled(True)
+        QMessageBox.critical(self, "错误", msg)
 
     def _on_task_error(self, msg: str) -> None:
         self.pause_btn.setChecked(False)
         self.pause_btn.setEnabled(False)
         self.pause_btn.setText("暂停训练")
+        self.train_btn.setEnabled(True)
         QMessageBox.critical(self, "错误", msg)
 
     def _build_visualize_tab(self) -> QWidget:
@@ -573,16 +1174,31 @@ class MainWindow(QMainWindow):
 
         form = QFormLayout()
         form.setSpacing(10)
-        self.vis_model_combo, model_row = self._path_row("recent_model_dir", "dir")
+        self.vis_model_combo, model_row = self._path_row("recent_vis_model_dir", "dir")
         form.addRow("模型目录:", model_row)
         self.vis_data_combo, data_row = self._path_row("recent_visualize_data", "file")
         form.addRow("数据文件:", data_row)
 
-        self.vis_percentile_spin = QSpinBox()
-        self.vis_percentile_spin.setRange(90, 100)
-        self.vis_percentile_spin.setValue(99)
+        self.vis_percentile_spin = QDoubleSpinBox()
+        self.vis_percentile_spin.setRange(90.0, 100.0)
+        self.vis_percentile_spin.setDecimals(2)
+        self.vis_percentile_spin.setSingleStep(0.05)
+        self.vis_percentile_spin.setValue(99.0)
         self.vis_percentile_spin.setSuffix(" %")
         form.addRow("异常阈值:", self.vis_percentile_spin)
+
+        self.vis_samples_spin = QSpinBox()
+        self.vis_samples_spin.setRange(100, 24462)
+        self.vis_samples_spin.setValue(5000)
+        self.vis_samples_spin.setSingleStep(500)
+        self.vis_samples_spin.setSuffix(" 个")
+        form.addRow("最大样本数:", self.vis_samples_spin)
+
+        self.vis_dim_combo = QComboBox()
+        self.vis_dim_combo.addItem("2D")
+        self.vis_dim_combo.addItem("3D")
+        self.vis_dim_combo.currentTextChanged.connect(self._on_vis_dim_changed)
+        form.addRow("维度:", self.vis_dim_combo)
         layout.addLayout(form)
 
         run_btn = QPushButton("开始分析")
@@ -594,6 +1210,16 @@ class MainWindow(QMainWindow):
         self.vis_chart_view = QChartView(self.vis_chart)
         self.vis_chart_view.setRenderHint(QPainter.RenderHint.Antialiasing)
         layout.addWidget(self.vis_chart_view, 1)
+
+        self.vis_scatter_3d = None
+        try:
+            self.vis_scatter_3d = PointCloud3DWidget()
+            self.vis_scatter_3d.setVisible(False)
+            layout.addWidget(self.vis_scatter_3d, 1)
+        except Exception as exc:  # noqa: BLE001 - 环境不支持 OpenGL 时降级
+            logger.warning(f"3D 可视化初始化失败，已降级为仅 2D: {exc}")
+            self.vis_dim_combo.setEnabled(False)
+            self.vis_dim_combo.setCurrentText("2D")
 
         self.vis_info = QLabel("尚未分析")
         self.vis_info.setWordWrap(True)
@@ -609,7 +1235,7 @@ class MainWindow(QMainWindow):
         if not data:
             QMessageBox.warning(self, "提示", "请选择数据文件")
             return
-        self._remember_path(self.vis_model_combo, "recent_model_dir", model_dir)
+        self._remember_path(self.vis_model_combo, "recent_vis_model_dir", model_dir)
         self._remember_path(self.vis_data_combo, "recent_visualize_data", data)
 
         self.vis_info.setText("正在分析...")
@@ -618,6 +1244,8 @@ class MainWindow(QMainWindow):
             data_path=data,
             model_dir=model_dir,
             percentile=self.vis_percentile_spin.value(),
+            max_samples=self.vis_samples_spin.value(),
+            n_components=3 if self.vis_dim_combo.currentText() == "3D" else 2,
         )
         self._vis_worker.done_signal.connect(self._on_visualize_done)
         self._vis_worker.error_signal.connect(self._on_task_error)
@@ -627,28 +1255,46 @@ class MainWindow(QMainWindow):
         coords = summary["coords"]
         flags = summary["is_anomaly"]
 
-        chart = QChart()
-        chart.setTitle("NIR 瓶颈特征 2D 可视化（PCA）")
-        normal = QScatterSeries()
-        normal.setName("正常")
-        normal.setMarkerSize(4)
-        normal.setColor(QColor("#D8A24A"))
-        anom = QScatterSeries()
-        anom.setName("异常")
-        anom.setMarkerSize(7)
-        anom.setColor(QColor("#D64545"))
-        for (x, y), f in zip(coords, flags):
-            (anom if f else normal).append(float(x), float(y))
-        chart.addSeries(normal)
-        chart.addSeries(anom)
-        chart.createDefaultAxes()
+        # 2D（QScatterSeries）与 3D（自定义 OpenGL 点云）均可全量渲染
+        n_comp = summary.get("n_components", 2)
+        use_3d = n_comp == 3 and self.vis_scatter_3d is not None
 
-        self.vis_chart_view.setChart(chart)
+        if use_3d:
+            self._plot_scatter_3d(coords, flags)
+        else:
+            chart = QChart()
+            chart.setTitle("NIR 瓶颈特征 2D 可视化（PCA）")
+            normal = QScatterSeries()
+            normal.setName("正常")
+            normal.setMarkerSize(4)
+            normal.setColor(QColor("#D8A24A"))
+            anom = QScatterSeries()
+            anom.setName("异常")
+            anom.setMarkerSize(7)
+            anom.setColor(QColor("#D64545"))
+            for (x, y), f in zip(coords, flags):
+                (anom if f else normal).append(float(x), float(y))
+            chart.addSeries(normal)
+            chart.addSeries(anom)
+            chart.createDefaultAxes()
+            self.vis_chart_view.setChart(chart)
+
         self.vis_info.setText(
-            f"样本 {summary['samples']}，异常 {int(flags.sum())} 个"
+            f"样本 {summary['samples']}，异常 {int(summary['is_anomaly'].sum())} 个"
             f"（阈值 {summary['threshold']:.4f}），"
-            f"PCA 前 2 主成分解释方差 {summary['explained']:.1%}"
+            f"PCA 前 {n_comp} 主成分解释方差 {summary['explained']:.1%}"
         )
+
+    def _on_vis_dim_changed(self, text: str) -> None:
+        """切换 2D / 3D 视图。"""
+        is_3d = text == "3D"
+        self.vis_chart_view.setVisible(not is_3d)
+        if self.vis_scatter_3d is not None:
+            self.vis_scatter_3d.setVisible(is_3d)
+
+    def _plot_scatter_3d(self, coords, flags) -> None:
+        """用自定义 OpenGL 点云绘制三维散点图（PC1/PC2/PC3），支持全量样本。"""
+        self.vis_scatter_3d.set_points(coords, flags)
 
     def _build_help_tab(self) -> QWidget:
         tab = QWidget()
@@ -678,13 +1324,98 @@ class MainWindow(QMainWindow):
             else:
                 logger.info(f"上次文件已不存在，仅回填路径: {last_file}")
 
+        self._restore_train_config()
+
     def closeEvent(self, event: QCloseEvent) -> None:
-        """关闭时保存窗口位置与当前文件路径。"""
+        """关闭时保存窗口位置、当前文件路径与训练参数。"""
         self._memory.set("geometry", bytes(self.saveGeometry()).hex())
         self._memory.set("last_file", self.path_edit.text() or "")
+        self._save_train_config()
         self._memory.save()
         logger.info("关闭界面，已保存配置记忆")
         event.accept()
+
+    def _save_train_config(self) -> None:
+        """保存训练页签的所有参数到配置记忆。"""
+        self._memory.set(
+            "train_config",
+            {
+                "epochs": self.epochs_spin.value(),
+                "batch_size": self.batch_spin.value(),
+                "lr": self.lr_spin.value(),
+                "bottleneck": self.bottleneck_spin.value(),
+                "train_ratio": self.ratio_spin.value(),
+                "device": self.device_combo.currentData(),
+                "spectrum": self.spectrum_combo.currentData(),
+                "pre_smooth": self.pre_smooth_cb.isChecked(),
+                "pre_snv": self.pre_snv_cb.isChecked(),
+                "pre_msc": self.pre_msc_cb.isChecked(),
+                "pre_deriv1": self.pre_d1_cb.isChecked(),
+                "pre_deriv2": self.pre_d2_cb.isChecked(),
+                "outlier_enabled": self.outlier_cb.isChecked(),
+                "outlier_k": self.outlier_k_spin.value(),
+                "outlier_auto": self.outlier_auto_cb.isChecked(),
+                "outlier_pct": self.outlier_pct_spin.value(),
+                "vis_percentile": self.vis_percentile_spin.value(),
+                "vis_samples": self.vis_samples_spin.value(),
+                "ft_label_column": self.ft_label_combo.currentText(),
+                "ft_label_index": self.ft_label_index_spin.value(),
+                "ft_epochs": self.ft_epochs_spin.value(),
+                "ft_batch": self.ft_batch_spin.value(),
+                "ft_lr": self.ft_lr_spin.value(),
+                "ft_ratio": self.ft_ratio_spin.value(),
+                "ft_max_samples": self.ft_max_samples_spin.value(),
+                "ft_freeze": self.ft_freeze_cb.isChecked(),
+                "ft_unfreeze": self.ft_unfreeze_spin.value(),
+                "ft_cv": self.ft_cv_spin.value(),
+                "ft_device": self.ft_device_combo.currentData(),
+            },
+        )
+
+    def _restore_train_config(self) -> None:
+        """恢复训练页签上次的参数。"""
+        cfg = self._memory.get("train_config")
+        if not isinstance(cfg, dict):
+            return
+        self.epochs_spin.setValue(int(cfg.get("epochs", self.epochs_spin.value())))
+        self.batch_spin.setValue(int(cfg.get("batch_size", self.batch_spin.value())))
+        self.lr_spin.setValue(float(cfg.get("lr", self.lr_spin.value())))
+        self.bottleneck_spin.setValue(int(cfg.get("bottleneck", self.bottleneck_spin.value())))
+        self.ratio_spin.setValue(int(cfg.get("train_ratio", self.ratio_spin.value())))
+        dev_idx = self.device_combo.findData(cfg.get("device"))
+        if dev_idx >= 0:
+            self.device_combo.setCurrentIndex(dev_idx)
+        spec_idx = self.spectrum_combo.findData(cfg.get("spectrum"))
+        if spec_idx >= 0:
+            self.spectrum_combo.setCurrentIndex(spec_idx)
+        self.pre_smooth_cb.setChecked(bool(cfg.get("pre_smooth", False)))
+        self.pre_snv_cb.setChecked(bool(cfg.get("pre_snv", False)))
+        self.pre_msc_cb.setChecked(bool(cfg.get("pre_msc", False)))
+        self.pre_d1_cb.setChecked(bool(cfg.get("pre_deriv1", False)))
+        self.pre_d2_cb.setChecked(bool(cfg.get("pre_deriv2", False)))
+        self.outlier_cb.setChecked(bool(cfg.get("outlier_enabled", False)))
+        self.outlier_k_spin.setValue(int(cfg.get("outlier_k", self.outlier_k_spin.value())))
+        self.outlier_pct_spin.setValue(float(cfg.get("outlier_pct", self.outlier_pct_spin.value())))
+        self.outlier_auto_cb.setChecked(bool(cfg.get("outlier_auto", False)))
+        self.vis_percentile_spin.setValue(float(cfg.get("vis_percentile", self.vis_percentile_spin.value())))
+        self.vis_samples_spin.setValue(int(cfg.get("vis_samples", self.vis_samples_spin.value())))
+        ft_col = cfg.get("ft_label_column")
+        if ft_col:
+            ft_col_idx = self.ft_label_combo.findText(str(ft_col))
+            if ft_col_idx >= 0:
+                self.ft_label_combo.setCurrentIndex(ft_col_idx)
+        self.ft_label_index_spin.setValue(int(cfg.get("ft_label_index", self.ft_label_index_spin.value())))
+        self.ft_epochs_spin.setValue(int(cfg.get("ft_epochs", self.ft_epochs_spin.value())))
+        self.ft_batch_spin.setValue(int(cfg.get("ft_batch", self.ft_batch_spin.value())))
+        self.ft_lr_spin.setValue(float(cfg.get("ft_lr", self.ft_lr_spin.value())))
+        self.ft_ratio_spin.setValue(int(cfg.get("ft_ratio", self.ft_ratio_spin.value())))
+        self.ft_max_samples_spin.setValue(int(cfg.get("ft_max_samples", self.ft_max_samples_spin.value())))
+        self.ft_freeze_cb.setChecked(bool(cfg.get("ft_freeze", True)))
+        self.ft_unfreeze_spin.setValue(int(cfg.get("ft_unfreeze", self.ft_unfreeze_spin.value())))
+        self.ft_cv_spin.setValue(int(cfg.get("ft_cv", self.ft_cv_spin.value())))
+        ft_dev_idx = self.ft_device_combo.findData(cfg.get("ft_device"))
+        if ft_dev_idx >= 0:
+            self.ft_device_combo.setCurrentIndex(ft_dev_idx)
 
     def _open_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(

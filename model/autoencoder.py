@@ -102,11 +102,13 @@ def train_ae(
     val_X: np.ndarray | None = None,
     device: torch.device | None = None,
     pause_event: threading.Event | None = None,
+    on_epoch=None,
     log=None,
 ) -> dict:
     """自监督训练（重建损失）。返回 {"train": [...], "val": [...]}。
 
-    ``pause_event`` 非空时，每个 epoch 开始前若被 set 则阻塞等待（用于暂停）。
+    ``pause_event`` 非空时，每个 epoch 开始前若被 set 则阻塞等待（用于暂停）；
+    ``on_epoch`` 每个 epoch 结束时回调 ``on_epoch(epoch, epochs, train_loss, val_loss)``。
     """
     device = device or get_device()
     model.to(device)
@@ -147,6 +149,9 @@ def train_ae(
             with torch.no_grad():
                 val_loss = float(criterion(model(Xv), Xv).item())
             val_losses.append(val_loss)
+
+        if on_epoch is not None:
+            on_epoch(epoch, epochs, epoch_loss, val_loss, None)
 
         if log and (epoch == 1 or epoch % 5 == 0 or epoch == epochs):
             vmsg = f"  val={val_loss:.6f}" if val_loss is not None else ""
@@ -205,11 +210,15 @@ def save_model(
     return out_dir
 
 
-def load_model(model_dir: str | Path, input_dim: int = INPUT_DIM, bottleneck: int = BOTTLENECK):
+def load_model(model_dir: str | Path, input_dim: int | None = None, bottleneck: int | None = None):
     model_dir = Path(model_dir)
+    state = torch.load(model_dir / "autoencoder.pt", map_location="cpu", weights_only=True)
+    # 从权重推断真实输入维度与瓶颈维度，兼容 SpectrumData(1024)/Abs(301) 等不同字段
+    if input_dim is None:
+        input_dim = int(state["encoder.0.weight"].shape[1])
+    if bottleneck is None:
+        bottleneck = int(state["encoder.4.weight"].shape[0])
     model = Autoencoder(input_dim, bottleneck)
-    model.load_state_dict(
-        torch.load(model_dir / "autoencoder.pt", map_location="cpu", weights_only=True)
-    )
+    model.load_state_dict(state)
     d = np.load(model_dir / "standardize.npz")
     return model, d["mean"], d["std"]

@@ -17,6 +17,7 @@ class ModelWorker(QThread):
     log_signal = Signal(str)
     done_signal = Signal(object)
     error_signal = Signal(str)
+    epoch_signal = Signal(int, int, float, object, object)  # epoch, epochs, train_loss, val_loss, val_metrics
 
     def __init__(self, fn, **kwargs) -> None:
         super().__init__()
@@ -30,6 +31,9 @@ class ModelWorker(QThread):
             # 若目标函数声明了 pause_event 参数，则注入本线程的暂停事件
             if "pause_event" in inspect.signature(self._fn).parameters:
                 kwargs["pause_event"] = self.pause_event
+            # 若声明了 on_epoch，注入逐 epoch 进度回调
+            if "on_epoch" in inspect.signature(self._fn).parameters:
+                kwargs["on_epoch"] = self.epoch_signal.emit
             result = self._fn(log=self.log_signal.emit, **kwargs)
             self.done_signal.emit(result)
         except Exception as exc:  # noqa: BLE001 - 回传界面展示

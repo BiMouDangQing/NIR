@@ -74,7 +74,7 @@ cd d:\model\model\NIR-Pyruspyrifolia
 config/          # 全局配置、配置记忆
 md/              # 项目文档
 model/           # 算法模型（自编码器、预处理、离群剔除、降维、异常检测）
-model_output/    # 训练输出（模型权重、重构误差）
+model_output/    # 训练输出（模型权重、重构误差，按日期时间戳子目录存储）
 QT/              # 图形界面
 tools/           # 数据加载、日志、命令行工具
 runtime/         # 内置便携 Python 运行时（含全部依赖）
@@ -110,4 +110,5 @@ log/             # 运行日志、崩溃日志
 | `md/环境配置手册.md` | 环境搭建、依赖、FAQ |
 | `md/NIR-Pyruspyrifolia.md` | 功能与代码归属对照 |
 | `md/数据预处理.md` | 预处理与离群剔除说明 |
+| `md/算法与数据流.md` | 算法原理、字段意义、数据流全景 |
 | `md/CHANGELOG.md` | 改动日志 |
