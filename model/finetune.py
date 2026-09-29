@@ -292,7 +292,7 @@ def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
 
 
 def extended_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
-    """在基础回归指标上补充 MAPE、误差标准差与误差分位数。"""
+    """在基础回归指标上补充 MAPE、误差标准差、误差分位数与偏差区间占比。"""
     m = regression_metrics(y_true, y_pred)
     y_true = np.asarray(y_true, dtype=np.float32)
     y_pred = np.asarray(y_pred, dtype=np.float32)
@@ -307,4 +307,7 @@ def extended_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     m["err_std"] = float(np.std(err))
     m["err_p5"] = float(np.percentile(err, 5))
     m["err_p95"] = float(np.percentile(err, 95))
+    # 误差落在 ±0.5 度 / ±1 度 内的样本占比（0~1，绝对值，单位=糖度）
+    m["within_0p5"] = float(np.mean(np.abs(err) <= 0.5))
+    m["within_1p0"] = float(np.mean(np.abs(err) <= 1.0))
     return m

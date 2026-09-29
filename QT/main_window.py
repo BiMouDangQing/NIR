@@ -7,8 +7,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, Qt, QTimer, Signal
-from PySide6.QtGui import QCloseEvent, QColor, QPainter, QPixmap
+from PySide6.QtCore import QByteArray, QRectF, Qt, QTimer, Signal
+from PySide6.QtGui import QCloseEvent, QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -48,6 +48,8 @@ from PySide6.QtCharts import (
 
 from config.memory import AppMemory
 from config.settings import CONFIG_FILE
+from model.data_analysis import run_data_analysis
+from model.domain_shift import run_domain_shift
 from model.service import FINETUNE_DIR, run_finetune, run_finetune_predict, run_prediction, run_training, run_visualize
 from QT.theme import QIYUE_THEME
 from QT.pointcloud_3d import PointCloud3DWidget
@@ -85,6 +87,8 @@ _HELP_TEXT = """\
 | 模型预测 | 用已训练模型做异常检测，输出重构误差 |
 | 模型微调 | 用有标签数据微调回归头，预测指定指标（需提供真实标签） |
 | 降维可视化 | 瓶颈特征 PCA 到 2D 散点图 |
+| 分布核查 | 核查预训练样本与标签样本的分布一致性（域偏移检测） |
+| 数据分析 | 对预训练/微调/预测多批数据做分布统计、离群检测与相似性分析 |
 | 帮助 | 本页面 |
 
 ## 训练参数说明
@@ -138,6 +142,8 @@ class MainWindow(QMainWindow):
         self._df = None
         self._columns: list[str] = []
         self._zoom = 1.0
+        # 所有路径下拉框 (combo, 记忆 key)，用于关闭时统一保存当前值
+        self._path_combos: list[tuple[QComboBox, str]] = []
 
         self._build_ui()
         self._restore_state()
@@ -184,6 +190,8 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_predict_tab(), "模型预测")
         self.tabs.addTab(self._build_finetune_tab(), "模型微调")
         self.tabs.addTab(self._build_visualize_tab(), "降维可视化")
+        self.tabs.addTab(self._build_shift_tab(), "分布核查")
+        self.tabs.addTab(self._build_analysis_tab(), "数据分析")
         self.tabs.addTab(self._build_help_tab(), "帮助")
         root.addWidget(self.tabs, 1)
 
@@ -247,6 +255,7 @@ class MainWindow(QMainWindow):
         combo = QComboBox()
         combo.setEditable(True)
         combo.addItems(self._memory.get_recent(key))
+        self._path_combos.append((combo, key))
         btn = QPushButton("浏览...")
         if mode == "dir":
             btn.clicked.connect(lambda: self._browse_dir(combo, key))
@@ -341,6 +350,12 @@ class MainWindow(QMainWindow):
         self.device_combo.addItem("CPU", "cpu")
         self.device_combo.addItem("GPU (CUDA)", "cuda")
         form.addRow("训练设备:", self.device_combo)
+
+        self.recon_top_spin = QSpinBox()
+        self.recon_top_spin.setRange(1, 10)
+        self.recon_top_spin.setValue(3)
+        self.recon_top_spin.setSuffix(" 个（误差最大）")
+        form.addRow("重建对比样本数:", self.recon_top_spin)
         layout.addLayout(form)
 
         pre_box = QGroupBox("数据预处理（可选，勾选启用）")
@@ -407,6 +422,12 @@ class MainWindow(QMainWindow):
         self.train_chart_view = QChartView(self.train_chart)
         self.train_chart_view.setRenderHint(QPainter.RenderHint.Antialiasing)
         layout.addWidget(self.train_chart_view, 1)
+
+        self.train_recon_chart = QChart()
+        self.train_recon_chart.setTitle("重建光谱对比（训练完成后显示）")
+        self.train_recon_view = QChartView(self.train_recon_chart)
+        self.train_recon_view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        layout.addWidget(self.train_recon_view, 1)
 
         self.train_log = QPlainTextEdit()
         self.train_log.setReadOnly(True)
@@ -544,6 +565,14 @@ class MainWindow(QMainWindow):
         freeze_h.addWidget(self.ft_freeze_cb)
         freeze_h.addWidget(QLabel("最后"))
         freeze_h.addWidget(self.ft_unfreeze_spin)
+        freeze_h.addWidget(QLabel("解冻学习率:"))
+        self.ft_unfreeze_lr_spin = QDoubleSpinBox()
+        self.ft_unfreeze_lr_spin.setRange(0.0, 1.0)
+        self.ft_unfreeze_lr_spin.setDecimals(5)
+        self.ft_unfreeze_lr_spin.setSingleStep(0.0001)
+        self.ft_unfreeze_lr_spin.setValue(0.0001)
+        self.ft_unfreeze_lr_spin.setSpecialValueText("0=自动(学习率×0.1)")
+        freeze_h.addWidget(self.ft_unfreeze_lr_spin)
         freeze_h.addStretch()
         layout.addWidget(freeze_row)
 
@@ -671,6 +700,7 @@ class MainWindow(QMainWindow):
             preprocess=preprocess,
             remove_outliers=remove_outliers,
             spectrum_column=self.spectrum_combo.currentData(),
+            recon_top_n=self.recon_top_spin.value(),
         )
         self._train_worker.log_signal.connect(self.train_log.appendPlainText)
         self._train_worker.epoch_signal.connect(self._on_train_epoch)
@@ -685,12 +715,96 @@ class MainWindow(QMainWindow):
         self.train_btn.setEnabled(True)
         self.train_progress.setValue(self.train_progress.maximum())
         self.train_progress.setFormat("完成")
-        brief = {k: v for k, v in summary.items() if k != "history"}
+        self.train_btn.setEnabled(True)
+        brief = {k: v for k, v in summary.items() if k not in ("history", "recon_samples")}
         self.train_log.appendPlainText(f"\n训练完成：{brief}\n")
         self._plot_train_history(summary.get("history"))
+        self._plot_recon_comparison(summary.get("recon_samples"))
+        out_dir = summary.get("out_dir")
+        if out_dir:
+            # 自动填入预测页签的模型目录并记忆，便于直接使用新训练模型
+            self.pred_model_combo.setCurrentText(out_dir)
+            self._remember_path(self.pred_model_combo, "recent_pred_model_dir", out_dir)
+            self._save_chart_png(self.train_chart_view, Path(out_dir) / "loss_curve.png")
+            self._save_chart_png(self.train_recon_view, Path(out_dir) / "recon_comparison.png")
         QMessageBox.information(
             self, "完成", f"训练完成，模型已保存到：\n{summary.get('out_dir')}"
         )
+
+    def _append_recon_pair(self, chart: QChart, s: dict, color: QColor, name: str) -> None:
+        """向图表追加一对原始/重建光谱曲线（原始实线、重建虚线）。"""
+        orig = QLineSeries()
+        orig.setName(f"{name} - 原始")
+        pen_orig = QPen(color)
+        pen_orig.setWidth(2)
+        orig.setPen(pen_orig)
+        recon = QLineSeries()
+        recon.setName(f"{name} - 重建")
+        pen_recon = QPen(color)
+        pen_recon.setWidth(1)
+        pen_recon.setStyle(Qt.PenStyle.DashLine)
+        recon.setPen(pen_recon)
+        for i, v in enumerate(s["original"], 1):
+            orig.append(float(i), float(v))
+        for i, v in enumerate(s["recon"], 1):
+            recon.append(float(i), float(v))
+        chart.addSeries(orig)
+        chart.addSeries(recon)
+
+    def _plot_recon_comparison(self, recon_samples: dict | None) -> None:
+        """重建光谱对比图：原始 vs 重建，越重合说明重建越好。"""
+        if not recon_samples:
+            return
+        chart = QChart()
+        chart.setTitle("重建光谱对比（原始 vs 重建，越重合越好）")
+        worst_list = recon_samples.get("worst") or []
+        for rank, s in enumerate(worst_list, 1):
+            self._append_recon_pair(chart, s, QColor("#D64545"), f"误差第{rank}大")
+        best = recon_samples.get("best")
+        if best:
+            self._append_recon_pair(chart, best, QColor("#3BA776"), "误差最小")
+        chart.createDefaultAxes()
+        x_axes = chart.axes(Qt.Orientation.Horizontal)
+        y_axes = chart.axes(Qt.Orientation.Vertical)
+        if x_axes:
+            x_axes[0].setTitleText("波长序号")
+        if y_axes:
+            y_axes[0].setTitleText("光谱强度")
+        self.train_recon_view.setChart(chart)
+
+    def _apply_chart_cn_font(self, chart: QChart) -> None:
+        """给图表所有文本元素设置中文字体，避免离屏保存 PNG 时中文乱码。"""
+        font = QFont("Microsoft YaHei", 10)
+        chart.setTitleFont(font)
+        legend = chart.legend()
+        if legend is not None:
+            legend.setFont(font)
+        for axis in chart.axes():
+            axis.setTitleFont(font)
+            axis.setLabelsFont(font)
+
+    def _save_chart_png(self, view: QChartView, path: Path, width: int = 1600, height: int = 1000) -> None:
+        """把图表离屏渲染为固定尺寸 PNG（显式中文字体 + 白底）。
+
+        直接离屏渲染图表场景而非 grab 屏幕 widget，避免：
+        ① 中文因字体回退失败而乱码；② 子页签未激活导致渲染尺寸/内容与界面不一致。
+        """
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            chart = view.chart()
+            self._apply_chart_cn_font(chart)
+            # 按目标尺寸重排图表，保证渲染填满且与目标比例一致（不变形、无白边）
+            chart.resize(width, height)
+            image = QImage(width, height, QImage.Format.Format_ARGB32)
+            image.fill(Qt.GlobalColor.white)
+            painter = QPainter(image)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            view.render(painter, QRectF(0, 0, width, height))
+            painter.end()
+            if not image.save(str(path)):
+                logger.warning(f"图表保存失败: {path}")
+        except Exception as exc:  # noqa: BLE001 - 图表保存失败不应中断主流程
+            logger.warning(f"图表保存异常: {path}: {exc}")
 
     def _toggle_pause(self, checked: bool) -> None:
         """暂停/继续训练：设置或清除后台线程的暂停事件。"""
@@ -800,6 +914,11 @@ class MainWindow(QMainWindow):
     def _on_predict_done(self, summary: dict) -> None:
         self.pred_log.appendPlainText(f"\n预测完成：{summary}\n")
         self._plot_pred_histogram(summary)
+        out_dir = summary.get("out_dir")
+        if out_dir:
+            self._save_chart_png(
+                self.pred_chart_view, Path(out_dir) / "reconstruction_error_histogram.png"
+            )
         self.pred_metric.setText(
             f"样本 {summary['samples']} | 均值 {summary['recon_err_mean']:.4f} | "
             f"中位数 {summary['recon_err_median']:.4f} | "
@@ -884,6 +1003,7 @@ class MainWindow(QMainWindow):
             lr=self.ft_lr_spin.value(),
             freeze=self.ft_freeze_cb.isChecked(),
             unfreeze_epochs=self.ft_unfreeze_spin.value() if self.ft_freeze_cb.isChecked() else 0,
+            unfreeze_lr=self.ft_unfreeze_lr_spin.value() or None,
             train_ratio=self.ft_ratio_spin.value() / 100.0,
             max_samples=max_samples or None,
             k_folds=self.ft_cv_spin.value(),
@@ -902,6 +1022,10 @@ class MainWindow(QMainWindow):
         self.finetune_btn.setEnabled(True)
         self.ft_progress.setValue(self.ft_progress.maximum())
         self.ft_progress.setFormat("完成")
+        # 先保存实时图（含验证 R² 双轴），再覆盖为静态损失曲线
+        out_dir = summary.get("out_dir")
+        if out_dir:
+            self._save_chart_png(self.ft_chart_view, Path(out_dir) / "loss_curve.png")
         self._plot_finetune_history(summary.get("history"))
         cv = summary.get("cv")
         cv_text = ""
@@ -919,9 +1043,10 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self, "完成", f"微调完成，模型已保存到：\n{summary.get('out_dir')}"
         )
-        # 自动填入评估区的微调模型目录，方便直接预测评估
-        if self.ft_eval_model_combo.count() == 0 or not self.ft_eval_model_combo.currentText().strip():
-            self.ft_eval_model_combo.setCurrentText(summary.get("out_dir", ""))
+        # 自动填入评估区的微调模型目录并记忆，方便直接预测评估
+        if out_dir:
+            self.ft_eval_model_combo.setCurrentText(out_dir)
+            self._remember_path(self.ft_eval_model_combo, "recent_finetune_model", out_dir)
 
     def _start_ft_eval(self) -> None:
         worker = getattr(self, "_ft_eval_worker", None)
@@ -960,7 +1085,8 @@ class MainWindow(QMainWindow):
                 f"R² {metrics['r2']:.4f} | 相关系数 {metrics['corr']:.4f} | MAPE {metrics['mape']:.2f}% | "
                 f"偏差 {metrics['bias']:+.4f}\n"
                 f"误差: 均值 {metrics['bias']:+.4f}, 标准差 {metrics['err_std']:.4f}, "
-                f"5%~95% 区间 [{metrics['err_p5']:+.3f}, {metrics['err_p95']:+.3f}]"
+                f"5%~95% 区间 [{metrics['err_p5']:+.3f}, {metrics['err_p95']:+.3f}]\n"
+                f"准确度: ±0.5 度内 {metrics.get('within_0p5', 0.0):.1%}，±1 度内 {metrics.get('within_1p0', 0.0):.1%}"
             )
         else:
             self.ft_eval_metric.setText(
@@ -972,6 +1098,17 @@ class MainWindow(QMainWindow):
             self._plot_ft_eval_scatter(scatters)
             self._plot_ft_residual(scatters)
             self._plot_ft_error_hist(scatters)
+            out_dir = summary.get("out_dir")
+            if out_dir:
+                self._save_chart_png(
+                    self.ft_eval_scatter_view, Path(out_dir) / "scatter_pred_vs_true.png"
+                )
+                self._save_chart_png(
+                    self.ft_eval_resid_view, Path(out_dir) / "residual.png"
+                )
+                self._save_chart_png(
+                    self.ft_eval_hist_view, Path(out_dir) / "error_histogram.png"
+                )
         QMessageBox.information(
             self, "完成", f"预测完成，结果已保存到：\n{summary.get('out_path')}"
         )
@@ -1296,6 +1433,342 @@ class MainWindow(QMainWindow):
         """用自定义 OpenGL 点云绘制三维散点图（PC1/PC2/PC3），支持全量样本。"""
         self.vis_scatter_3d.set_points(coords, flags)
 
+    # ---------- 分布核查 ----------
+    def _build_shift_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(12)
+
+        form = QFormLayout()
+        form.setSpacing(10)
+        self.shift_pretrain_combo, p_row = self._path_row("recent_shift_pretrain", "file")
+        form.addRow("预训练数据文件:", p_row)
+        self.shift_label_combo, l_row = self._path_row("recent_shift_label", "file")
+        form.addRow("标签数据文件:", l_row)
+
+        self.shift_spectrum_combo = QComboBox()
+        self.shift_spectrum_combo.addItem("SpectrumData（1024 维）", "SpectrumData")
+        self.shift_spectrum_combo.addItem("Abs（301 维）", "Abs")
+        form.addRow("光谱字段:", self.shift_spectrum_combo)
+        layout.addLayout(form)
+
+        pre_box = QGroupBox("对比前预处理（可选，消除散射/尺度后再比较）")
+        pre_layout = QHBoxLayout(pre_box)
+        self.shift_smooth_cb = QCheckBox("S-G 平滑")
+        self.shift_smooth_cb.setChecked(True)
+        self.shift_msc_cb = QCheckBox("MSC")
+        self.shift_msc_cb.setChecked(True)
+        self.shift_snv_cb = QCheckBox("SNV")
+        for cb in (self.shift_smooth_cb, self.shift_msc_cb, self.shift_snv_cb):
+            pre_layout.addWidget(cb)
+        pre_layout.addStretch()
+        layout.addWidget(pre_box)
+
+        btn_row = QHBoxLayout()
+        self.shift_btn = QPushButton("开始核查")
+        self.shift_btn.clicked.connect(self._start_shift)
+        btn_row.addWidget(self.shift_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        self.shift_result = QLabel("尚未核查")
+        self.shift_result.setWordWrap(True)
+        layout.addWidget(self.shift_result)
+
+        self.shift_tabs = QTabWidget()
+        self.shift_wave_chart = QChart()
+        self.shift_wave_view = QChartView(self.shift_wave_chart)
+        self.shift_wave_view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.shift_pca_chart = QChart()
+        self.shift_pca_view = QChartView(self.shift_pca_chart)
+        self.shift_pca_view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.shift_hist_chart = QChart()
+        self.shift_hist_view = QChartView(self.shift_hist_chart)
+        self.shift_hist_view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.shift_tabs.addTab(self.shift_wave_view, "平均光谱对比")
+        self.shift_tabs.addTab(self.shift_pca_view, "PCA 重叠")
+        self.shift_tabs.addTab(self.shift_hist_view, "标签分布")
+        layout.addWidget(self.shift_tabs, 1)
+
+        self.shift_log = QPlainTextEdit()
+        self.shift_log.setReadOnly(True)
+        self.shift_log.setPlaceholderText("核查日志将显示在这里...")
+        layout.addWidget(self.shift_log, 1)
+        return tab
+
+    def _start_shift(self) -> None:
+        worker = getattr(self, "_shift_worker", None)
+        if worker is not None and worker.isRunning():
+            QMessageBox.warning(self, "提示", "分布核查正在进行中，请等待完成。")
+            return
+        pretrain = self.shift_pretrain_combo.currentText().strip()
+        label = self.shift_label_combo.currentText().strip()
+        if not pretrain:
+            QMessageBox.warning(self, "提示", "请选择预训练数据文件")
+            return
+        if not label:
+            QMessageBox.warning(self, "提示", "请选择标签数据文件")
+            return
+        self._remember_path(self.shift_pretrain_combo, "recent_shift_pretrain", pretrain)
+        self._remember_path(self.shift_label_combo, "recent_shift_label", label)
+
+        preprocess = {
+            "smooth": self.shift_smooth_cb.isChecked(),
+            "msc": self.shift_msc_cb.isChecked(),
+            "snv": self.shift_snv_cb.isChecked(),
+        }
+        self.shift_log.clear()
+        self.shift_log.appendPlainText(f"开始分布核查：\n预训练 {pretrain}\n标签 {label}\n")
+        self.shift_result.setText("正在核查...")
+        self.shift_btn.setEnabled(False)
+        self._shift_worker = ModelWorker(
+            run_domain_shift,
+            pretrain_path=pretrain,
+            label_path=label,
+            spectrum_column=self.shift_spectrum_combo.currentData(),
+            preprocess=preprocess,
+        )
+        self._shift_worker.log_signal.connect(self.shift_log.appendPlainText)
+        self._shift_worker.done_signal.connect(self._on_shift_done)
+        self._shift_worker.error_signal.connect(self._on_shift_error)
+        self._shift_worker.start()
+
+    def _on_shift_done(self, summary: dict) -> None:
+        self.shift_btn.setEnabled(True)
+        ms = summary["mean_spectrum"]
+        pca = summary["pca"]
+        mah = summary["mahalanobis"]
+        knn = summary["knn"]
+        auc = summary["domain_classifier_auc"]
+        ld = summary.get("label_dist") or {}
+        text = (
+            f"预训练 {summary['samples']['pretrain']} 样本 / 标签 {summary['samples']['label']} 样本\n"
+            f"① 平均光谱相关系数 {ms['corr']:.3f}；全局均值 预训练 {ms['pretrain_global']['mean']:.0f} "
+            f"vs 标签 {ms['label_global']['mean']:.0f}\n"
+            f"② PCA 质心归一化距离 {pca['normalized_distance']:.2f}（<1 重叠，>3 分离）\n"
+            f"③ 马氏距离超 95% 边界比例 {mah['outlier_ratio']:.0%}（同分布 ≈5%）\n"
+            f"④ KNN 覆盖度比值 {knn['ratio']:.1f}（≈1 覆盖良好）\n"
+            f"⑤ 领域判别器 AUC {auc:.3f}（≈0.5 同分布，>0.8 差异明显）"
+        )
+        if ld.get("predicted_value") and ld.get("real_value"):
+            pv = ld["predicted_value"]
+            rv = ld["real_value"]
+            text += f"\n⑥ 仪器预测糖度 {pv['mean']:.2f} vs 真实糖度 {rv['mean']:.2f}"
+        self.shift_result.setText(text)
+
+        plot = summary.get("plot") or {}
+        if plot.get("mean_wave"):
+            self._plot_shift_mean_wave(plot["mean_wave"])
+        if plot.get("pca"):
+            self._plot_shift_pca(plot["pca"])
+        if plot.get("pred_hist") or plot.get("real_hist"):
+            self._plot_shift_label_hist(plot)
+        self.shift_log.appendPlainText("核查完成。")
+
+    def _plot_shift_mean_wave(self, wave: dict) -> None:
+        """平均光谱对比图。"""
+        chart = QChart()
+        chart.setTitle("平均光谱对比（预训练 vs 标签，越重合越同分布）")
+        p = QLineSeries()
+        p.setName("预训练")
+        p.setColor(QColor("#D8A24A"))
+        for x, y in zip(wave["x"], wave["pretrain"]):
+            p.append(float(x), float(y))
+        l = QLineSeries()
+        l.setName("标签")
+        l.setColor(QColor("#4A90D8"))
+        for x, y in zip(wave["x"], wave["label"]):
+            l.append(float(x), float(y))
+        chart.addSeries(p)
+        chart.addSeries(l)
+        chart.createDefaultAxes()
+        x_axes = chart.axes(Qt.Orientation.Horizontal)
+        y_axes = chart.axes(Qt.Orientation.Vertical)
+        if x_axes:
+            x_axes[0].setTitleText("波长序号")
+        if y_axes:
+            y_axes[0].setTitleText("光谱强度")
+        self.shift_wave_view.setChart(chart)
+
+    def _plot_shift_pca(self, pca: dict) -> None:
+        """PCA 联合投影散点图（两批重叠=同分布，分离=偏移）。"""
+        chart = QChart()
+        chart.setTitle("PCA 联合投影（重叠=同分布，分离=分布偏移）")
+        normal = QScatterSeries()
+        normal.setName("预训练")
+        normal.setMarkerSize(4)
+        normal.setColor(QColor("#D8A24A"))
+        for x, y in zip(pca["pretrain_x"], pca["pretrain_y"]):
+            normal.append(float(x), float(y))
+        label = QScatterSeries()
+        label.setName("标签")
+        label.setMarkerSize(7)
+        label.setColor(QColor("#D64545"))
+        for x, y in zip(pca["label_x"], pca["label_y"]):
+            label.append(float(x), float(y))
+        chart.addSeries(normal)
+        chart.addSeries(label)
+        chart.createDefaultAxes()
+        x_axes = chart.axes(Qt.Orientation.Horizontal)
+        y_axes = chart.axes(Qt.Orientation.Vertical)
+        if x_axes:
+            x_axes[0].setTitleText("PC1")
+        if y_axes:
+            y_axes[0].setTitleText("PC2")
+        self.shift_pca_view.setChart(chart)
+
+    def _plot_shift_label_hist(self, plot: dict) -> None:
+        """标签分布对比图（仪器预测糖度 vs 真实糖度，归一化密度折线）。"""
+        chart = QChart()
+        chart.setTitle("标签分布对比（仪器预测糖度 vs 真实糖度）")
+        for key, color, name in (
+            ("pred_hist", QColor("#D8A24A"), "仪器预测糖度"),
+            ("real_hist", QColor("#4A90D8"), "真实糖度"),
+        ):
+            hist = plot.get(key)
+            if not hist:
+                continue
+            edges, counts = hist
+            total = sum(counts) or 1
+            series = QLineSeries()
+            series.setName(name)
+            series.setColor(color)
+            for i, c in enumerate(counts):
+                center = (edges[i] + edges[i + 1]) / 2.0
+                series.append(float(center), float(c) / total)
+            chart.addSeries(series)
+        chart.createDefaultAxes()
+        x_axes = chart.axes(Qt.Orientation.Horizontal)
+        y_axes = chart.axes(Qt.Orientation.Vertical)
+        if x_axes:
+            x_axes[0].setTitleText("糖度")
+        if y_axes:
+            y_axes[0].setTitleText("占比")
+        self.shift_hist_view.setChart(chart)
+
+    def _on_shift_error(self, msg: str) -> None:
+        self.shift_btn.setEnabled(True)
+        self.shift_result.setText("核查失败")
+        QMessageBox.critical(self, "错误", msg)
+
+    # ---------- 数据分析（多批：分布 / 异常 / 相似性） ----------
+    def _build_analysis_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(12)
+
+        form = QFormLayout()
+        form.setSpacing(10)
+        self.ana_pretrain_combo, p_row = self._path_row("recent_ana_pretrain", "file")
+        form.addRow("预训练数据文件:", p_row)
+        self.ana_finetune_combo, f_row = self._path_row("recent_ana_finetune", "file")
+        form.addRow("微调数据文件:", f_row)
+        self.ana_predict_combo, pr_row = self._path_row("recent_ana_predict", "file")
+        form.addRow("预测数据文件:", pr_row)
+        layout.addLayout(form)
+
+        pre_box = QGroupBox("预处理（可选，消除散射/尺度后再分析）")
+        pre_layout = QHBoxLayout(pre_box)
+        self.ana_smooth_cb = QCheckBox("S-G 平滑")
+        self.ana_smooth_cb.setChecked(True)
+        self.ana_msc_cb = QCheckBox("MSC")
+        self.ana_msc_cb.setChecked(True)
+        self.ana_snv_cb = QCheckBox("SNV")
+        for cb in (self.ana_smooth_cb, self.ana_msc_cb, self.ana_snv_cb):
+            pre_layout.addWidget(cb)
+        pre_layout.addStretch()
+        layout.addWidget(pre_box)
+
+        btn_row = QHBoxLayout()
+        self.ana_btn = QPushButton("开始分析")
+        self.ana_btn.clicked.connect(self._start_analysis)
+        btn_row.addWidget(self.ana_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        self.ana_report = QPlainTextEdit()
+        self.ana_report.setReadOnly(True)
+        self.ana_report.setPlaceholderText(
+            "分析报告将显示在这里：各批数据的分布统计、离群（异常）样本、以及两两之间的相似性。"
+        )
+        layout.addWidget(self.ana_report, 1)
+        return tab
+
+    def _start_analysis(self) -> None:
+        worker = getattr(self, "_ana_worker", None)
+        if worker is not None and worker.isRunning():
+            QMessageBox.warning(self, "提示", "数据分析正在进行中，请等待完成。")
+            return
+        datasets: dict = {}
+        for name, combo, key in (
+            ("预训练", self.ana_pretrain_combo, "recent_ana_pretrain"),
+            ("微调", self.ana_finetune_combo, "recent_ana_finetune"),
+            ("预测", self.ana_predict_combo, "recent_ana_predict"),
+        ):
+            path = combo.currentText().strip()
+            if path:
+                datasets[name] = path
+                self._remember_path(combo, key, path)
+        if len(datasets) < 2:
+            QMessageBox.warning(self, "提示", "请至少选择 2 个数据文件")
+            return
+
+        preprocess = {
+            "smooth": self.ana_smooth_cb.isChecked(),
+            "msc": self.ana_msc_cb.isChecked(),
+            "snv": self.ana_snv_cb.isChecked(),
+        }
+        self.ana_report.clear()
+        self.ana_report.appendPlainText(
+            "开始数据分析：\n" + "\n".join(f"  {k}: {v}" for k, v in datasets.items()) + "\n"
+        )
+        self.ana_btn.setEnabled(False)
+        self._ana_worker = ModelWorker(
+            run_data_analysis,
+            datasets=datasets,
+            spectrum_column="SpectrumData",
+            preprocess=preprocess,
+        )
+        self._ana_worker.log_signal.connect(self.ana_report.appendPlainText)
+        self._ana_worker.done_signal.connect(self._on_analysis_done)
+        self._ana_worker.error_signal.connect(self._on_analysis_error)
+        self._ana_worker.start()
+
+    def _on_analysis_done(self, summary: dict) -> None:
+        self.ana_btn.setEnabled(True)
+        lines = ["", "===== 各数据分布与异常检测 ====="]
+        for name, s in summary["summary"].items():
+            lines.append(
+                f"【{name}】样本 {s['n']} | 光谱均值 {s['spectrum_mean']:.0f} | "
+                f"逐波长std均值 {s['spectrum_std_mean']:.0f}"
+            )
+            lines.append(f"  离群(异常)样本: {s['outliers']} 个（{s['outlier_ratio']:.1%}）")
+            ls = s.get("label_stats")
+            if ls:
+                lines.append(
+                    f"  标签 RealValue: 均值 {ls['mean']:.2f}, std {ls['std']:.3f}, "
+                    f"范围 [{ls['min']:.1f}, {ls['max']:.1f}]"
+                )
+        lines.append("")
+        lines.append("===== 两两相似性 =====")
+        for p in summary["pairwise"]:
+            lines.append(
+                f"{p['a']} vs {p['b']}: 质心距离 {p['centroid_norm']:.2f}, "
+                f"判别器 AUC {p['auc']:.3f}"
+            )
+        lines.append("")
+        lines.append(
+            "说明: 质心距离 <1 高度重叠，1~3 部分重叠，>3 明显分离；"
+            "判别器 AUC ≈0.5 表示同分布，>0.8 表示明显分布差异。"
+        )
+        self.ana_report.appendPlainText("\n".join(lines))
+
+    def _on_analysis_error(self, msg: str) -> None:
+        self.ana_btn.setEnabled(True)
+        QMessageBox.critical(self, "错误", msg)
+
     def _build_help_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -1327,9 +1800,14 @@ class MainWindow(QMainWindow):
         self._restore_train_config()
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        """关闭时保存窗口位置、当前文件路径与训练参数。"""
+        """关闭时保存窗口位置、当前文件路径、各页签路径与训练参数。"""
         self._memory.set("geometry", bytes(self.saveGeometry()).hex())
         self._memory.set("last_file", self.path_edit.text() or "")
+        # 统一保存所有路径下拉框的当前值（含手动输入/粘贴的路径）
+        for combo, key in self._path_combos:
+            path = combo.currentText().strip()
+            if path:
+                self._memory.add_recent(key, path)
         self._save_train_config()
         self._memory.save()
         logger.info("关闭界面，已保存配置记忆")
@@ -1356,8 +1834,13 @@ class MainWindow(QMainWindow):
                 "outlier_k": self.outlier_k_spin.value(),
                 "outlier_auto": self.outlier_auto_cb.isChecked(),
                 "outlier_pct": self.outlier_pct_spin.value(),
+                "recon_top": self.recon_top_spin.value(),
                 "vis_percentile": self.vis_percentile_spin.value(),
                 "vis_samples": self.vis_samples_spin.value(),
+                "shift_spectrum": self.shift_spectrum_combo.currentData(),
+                "shift_smooth": self.shift_smooth_cb.isChecked(),
+                "shift_msc": self.shift_msc_cb.isChecked(),
+                "shift_snv": self.shift_snv_cb.isChecked(),
                 "ft_label_column": self.ft_label_combo.currentText(),
                 "ft_label_index": self.ft_label_index_spin.value(),
                 "ft_epochs": self.ft_epochs_spin.value(),
@@ -1367,6 +1850,7 @@ class MainWindow(QMainWindow):
                 "ft_max_samples": self.ft_max_samples_spin.value(),
                 "ft_freeze": self.ft_freeze_cb.isChecked(),
                 "ft_unfreeze": self.ft_unfreeze_spin.value(),
+                "ft_unfreeze_lr": self.ft_unfreeze_lr_spin.value(),
                 "ft_cv": self.ft_cv_spin.value(),
                 "ft_device": self.ft_device_combo.currentData(),
             },
@@ -1397,8 +1881,15 @@ class MainWindow(QMainWindow):
         self.outlier_k_spin.setValue(int(cfg.get("outlier_k", self.outlier_k_spin.value())))
         self.outlier_pct_spin.setValue(float(cfg.get("outlier_pct", self.outlier_pct_spin.value())))
         self.outlier_auto_cb.setChecked(bool(cfg.get("outlier_auto", False)))
+        self.recon_top_spin.setValue(int(cfg.get("recon_top", self.recon_top_spin.value())))
         self.vis_percentile_spin.setValue(float(cfg.get("vis_percentile", self.vis_percentile_spin.value())))
         self.vis_samples_spin.setValue(int(cfg.get("vis_samples", self.vis_samples_spin.value())))
+        shift_spec_idx = self.shift_spectrum_combo.findData(cfg.get("shift_spectrum"))
+        if shift_spec_idx >= 0:
+            self.shift_spectrum_combo.setCurrentIndex(shift_spec_idx)
+        self.shift_smooth_cb.setChecked(bool(cfg.get("shift_smooth", True)))
+        self.shift_msc_cb.setChecked(bool(cfg.get("shift_msc", True)))
+        self.shift_snv_cb.setChecked(bool(cfg.get("shift_snv", False)))
         ft_col = cfg.get("ft_label_column")
         if ft_col:
             ft_col_idx = self.ft_label_combo.findText(str(ft_col))
@@ -1412,6 +1903,7 @@ class MainWindow(QMainWindow):
         self.ft_max_samples_spin.setValue(int(cfg.get("ft_max_samples", self.ft_max_samples_spin.value())))
         self.ft_freeze_cb.setChecked(bool(cfg.get("ft_freeze", True)))
         self.ft_unfreeze_spin.setValue(int(cfg.get("ft_unfreeze", self.ft_unfreeze_spin.value())))
+        self.ft_unfreeze_lr_spin.setValue(float(cfg.get("ft_unfreeze_lr", self.ft_unfreeze_lr_spin.value())))
         self.ft_cv_spin.setValue(int(cfg.get("ft_cv", self.ft_cv_spin.value())))
         ft_dev_idx = self.ft_device_combo.findData(cfg.get("ft_device"))
         if ft_dev_idx >= 0:

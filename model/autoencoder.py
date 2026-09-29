@@ -159,6 +159,86 @@ def train_ae(
     return {"train": train_losses, "val": val_losses}
 
 
+def train_mae(
+    model: Autoencoder,
+    X: np.ndarray,
+    epochs: int = 30,
+    batch_size: int = 256,
+    lr: float = 1e-3,
+    mask_ratio: float = 0.2,
+    val_X: np.ndarray | None = None,
+    device: torch.device | None = None,
+    pause_event: threading.Event | None = None,
+    on_epoch=None,
+    log=None,
+) -> dict:
+    """遮蔽自编码（MAE）自监督训练。
+
+    每个 batch 随机把 ``mask_ratio`` 比例的波长置 0（mask 掉），让模型用其余
+    波长重建被遮掉的波长，损失只计算被 mask 位置的 MSE，迫使模型学习波长间
+    的相关性而非直接拷贝输入。返回 {"train": [...], "val": [...]}。
+    """
+    device = device or get_device()
+    model.to(device)
+    model.train()
+    Xt = torch.tensor(X, dtype=torch.float32, device=device)
+    loader = DataLoader(TensorDataset(Xt), batch_size=batch_size, shuffle=True)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    train_losses: list[float] = []
+    val_losses: list[float] = []
+    Xv = (
+        torch.tensor(val_X, dtype=torch.float32, device=device)
+        if val_X is not None
+        else None
+    )
+
+    def _masked_loss(x: torch.Tensor) -> torch.Tensor:
+        """随机 mask 后重建，只对被 mask 位置计算 MSE。"""
+        mask = torch.rand(x.shape, device=device) < mask_ratio
+        x_masked = x.clone()
+        x_masked[mask] = 0.0
+        out = model(x_masked)
+        se = (out - x) ** 2
+        n = int(mask.sum())
+        if n == 0:
+            n = 1
+        return se[mask].sum() / n
+
+    for epoch in range(1, epochs + 1):
+        if pause_event is not None and pause_event.is_set():
+            if log:
+                log("训练已暂停，等待继续...")
+            while pause_event.is_set():
+                time.sleep(0.1)
+            if log:
+                log("训练继续。")
+        model.train()
+        total = 0.0
+        for (batch,) in loader:
+            opt.zero_grad()
+            loss = _masked_loss(batch)
+            loss.backward()
+            opt.step()
+            total += loss.item() * len(batch)
+        epoch_loss = total / len(Xt)
+        train_losses.append(epoch_loss)
+
+        val_loss: float | None = None
+        if Xv is not None:
+            model.eval()
+            with torch.no_grad():
+                val_loss = float(_masked_loss(Xv).item())
+            val_losses.append(val_loss)
+
+        if on_epoch is not None:
+            on_epoch(epoch, epochs, epoch_loss, val_loss, None)
+
+        if log and (epoch == 1 or epoch % 5 == 0 or epoch == epochs):
+            vmsg = f"  val={val_loss:.6f}" if val_loss is not None else ""
+            log(f"epoch {epoch}/{epochs}  loss={epoch_loss:.6f}{vmsg}")
+    return {"train": train_losses, "val": val_losses}
+
+
 @torch.no_grad()
 def encode_all(
     model: Autoencoder,

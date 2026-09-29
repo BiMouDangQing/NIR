@@ -8,10 +8,11 @@
 
 | 文档 | 内容 |
 | --- | --- |
-| [项目结构](项目结构.md) | 目录结构、模块职责、调用关系、六个页签 |
+| [项目结构](项目结构.md) | 目录结构、模块职责、调用关系、八个页签 |
 | [无监督学习](无监督学习.md) | 自编码器原理、公式、异常检测、PCA、参数含义 |
 | [数据预处理](数据预处理.md) | SNV/MSC/S-G/导数与离群剔除的公式与参数 |
 | [模型微调](模型微调.md) | 有监督微调原理、公式、评估指标、预测评估 |
+| [数据分布核查](数据分布核查.md) | 预训练与标签样本的域偏移检测方法与结果 |
 | [模型训练日志](模型训练日志.md) | 每次训练/微调的参数、结果、分析与建议 |
 | [算法与数据流](算法与数据流.md) | 字段含义、端到端数据流全景 |
 | [环境配置手册](环境配置手册.md) | 运行时、依赖、启动、GPU 配置 |
@@ -22,8 +23,8 @@
 | 目录 | 职责 | 对应代码 |
 | --- | --- | --- |
 | `config/` | 全局配置（路径、配置记忆） | `config/settings.py`、`config/memory.py` |
-| `model/` | 算法核心（自编码器/预处理/离群/降维/异常/微调/编排） | `model/*.py` |
-| `QT/` | 图形界面（6 页签） | `QT/main_window.py` 等 |
+| `model/` | 算法核心（自编码器/预处理/离群/降维/异常/微调/分布核查/数据分析/编排） | `model/*.py` |
+| `QT/` | 图形界面（8 页签） | `QT/main_window.py` 等 |
 | `tools/` | 工具库（parquet 解析、xlsx 转换、日志、CLI） | `tools/*.py` |
 | `md/` | 项目文档 | 本目录 |
 
@@ -97,7 +98,7 @@ PARQUET_ENGINE = "pyarrow"
 | 命令行入口 | `tools/cli.py` | 命令行解析 parquet（`python -m tools.cli`） |
 | 图形界面入口 | `QT/app.py` | 启动 Qt 界面（`python -m QT.app`） |
 | 主题样式 | `QT/theme.py` | 「秋月梨」QSS 配色 |
-| 主窗口 | `QT/main_window.py` | 数据预览 / 自监督预训练 / 预测 / 可视化 / 帮助（页签） |
+| 主窗口 | `QT/main_window.py` | 数据预览 / 自监督预训练 / 预测 / 可视化 / 分布核查 / 数据分析 / 帮助（页签） |
 | 日志 | `tools/logger.py` | 运行日志 `log/app_*.log` + 崩溃日志 `log/crash_*.log` |
 | 无监督聚类 | `tools/cluster_baseline.py` | 解析光谱→SNV→PCA→KMeans 基线 |
 | 自编码器 | `model/autoencoder.py` | 自监督预训练、特征学习、设备选择（CPU/GPU） |
@@ -106,6 +107,8 @@ PARQUET_ENGINE = "pyarrow"
 | 降维 | `model/reduce.py` | PCA 降维（可视化） |
 | 异常检测 | `model/anomaly.py` | 重构误差阈值与 TopN |
 | 建模服务 | `model/service.py` | 训练/预测/可视化编排，训练返回损失曲线 |
+| 分布核查 | `model/domain_shift.py` | 预训练与标签样本的 6 项域偏移检测 |
+| 数据分析 | `model/data_analysis.py` | 多批数据的分布统计/离群检测/两两相似性 |
 | 配置记忆 | `config/memory.py` | JSON 持久化窗口位置与上次路径 |
 
 ## 4. 实施状态

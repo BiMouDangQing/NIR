@@ -11,10 +11,11 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import torch
 
 from model import anomaly, finetune, reduce
 from model.outlier import cluster_outlier_mask
-from model.preprocess import apply_preprocessing
+from model.preprocess import apply_preprocessing, compute_msc_ref
 from model.autoencoder import (
     Autoencoder,
     encode_all,
@@ -78,13 +79,15 @@ def run_training(
     pause_event=None,
     on_epoch=None,
     spectrum_column: str = "SpectrumData",
+    recon_top_n: int = 3,
     log=None,
 ) -> dict:
     """自监督预训练 + 特征/异常输出。
 
     ``device`` 为 None 自动，或 "cpu"/"cuda"；
     ``preprocess`` 为可选预处理开关（见 model.preprocess.apply_preprocessing）；
-    ``remove_outliers`` 为可选离群剔除（见 model.outlier.cluster_outlier_mask）。
+    ``remove_outliers`` 为可选离群剔除（见 model.outlier.cluster_outlier_mask）；
+    ``recon_top_n`` 为重建对比图中展示的误差最大样本数量。
     """
     def _log(msg: str) -> None:
         logger.info(msg)
@@ -151,6 +154,33 @@ def run_training(
     for i, e in zip(idx, top_err):
         _log(f"  序号 {i}: 误差 {e:.4f}")
 
+    # 重建光谱对比样本：误差最大的 top N 个 + 误差最小 1 个，反标准化回原始尺度
+    model.eval()
+    with torch.no_grad():
+        rec = model(torch.tensor(Xs, dtype=torch.float32, device=device)).cpu().numpy()
+    X_orig = Xs * std + mean
+    rec_orig = rec * std + mean
+    top_n = max(1, int(recon_top_n))
+    worst_order = np.argsort(err)[::-1][:top_n]
+    worst_samples = []
+    for rank, i in enumerate(worst_order, 1):
+        worst_samples.append(
+            {
+                "label": f"误差第 {rank} 大（{err[i]:.4f}）",
+                "original": X_orig[i].tolist(),
+                "recon": rec_orig[i].tolist(),
+            }
+        )
+    best_i = int(np.argmin(err))
+    recon_samples = {
+        "worst": worst_samples,
+        "best": {
+            "label": f"重建误差最小（{err[best_i]:.4f}）",
+            "original": X_orig[best_i].tolist(),
+            "recon": rec_orig[best_i].tolist(),
+        },
+    }
+
     summary = {
         "samples": len(X),
         "dim": int(X.shape[1]),
@@ -161,6 +191,7 @@ def run_training(
         "recon_err_max": float(err.max()),
         "out_dir": str(out.resolve()),
         "history": history,
+        "recon_samples": recon_samples,
     }
     _log(f"训练完成，结果已保存: {out.resolve()}")
     return summary
@@ -213,10 +244,12 @@ def run_prediction(
     out_df["reconstruction_error"] = err
     if out_path:
         out_path = Path(out_path)
+        out_dir = out_path.parent
     else:
-        PREDICT_DIR.mkdir(parents=True, exist_ok=True)
-        out_path = PREDICT_DIR / f"{datetime.now():%Y%m%d_%H%M%S}.csv"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_dir = PREDICT_DIR / f"{datetime.now():%Y%m%d_%H%M%S}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / "reconstruction_error.csv"
+    out_dir.mkdir(parents=True, exist_ok=True)
     out_df.to_csv(out_path, index=False, encoding="utf-8-sig")
 
     idx, top_err = anomaly.top_anomalies(err, 10)
@@ -238,6 +271,7 @@ def run_prediction(
         "hist_centers": hist_centers,
         "hist_counts": hist_counts,
         "out_path": str(out_path.resolve()),
+        "out_dir": str(out_dir.resolve()),
     }
     _log(f"预测完成，结果已保存: {out_path.resolve()}")
     return summary
@@ -390,14 +424,19 @@ def run_finetune(
         _log(f"随机选取 {max_samples} 个有标签样本用于微调")
 
     pp_file = Path(model_dir) / "preprocess.json"
+    msc_ref = None
     if pp_file.exists():
         preprocess = json.loads(pp_file.read_text(encoding="utf-8"))
-        X = apply_preprocessing(X, preprocess)
+        if preprocess.get("msc"):
+            msc_ref = compute_msc_ref(X, preprocess)
+        X = apply_preprocessing(X, preprocess, msc_ref=msc_ref)
         used = ", ".join(k for k, v in preprocess.items() if v)
         _log(f"已应用预处理: {used or '无'}")
 
-    model, mean, std = load_model(model_dir)
-    Xs = (X - mean) / (std + 1e-8)
+    model, _, _ = load_model(model_dir)
+    # 用标签数据自身的 mean/std 标准化，抵消批次间整体强度偏移
+    # （若复用预训练 mean/std，标签数据会被推到分布外，如 -4σ）
+    Xs, ft_mean, ft_std = standardize(X)
 
     bottleneck = int(model.encoder[4].out_features)
 
@@ -444,7 +483,7 @@ def run_finetune(
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = (Path(out_dir) if out_dir else FINETUNE_DIR) / timestamp
-    finetune.save_finetune(head, out_dir, model, mean, std, label_column, label_index, freeze, bottleneck, y_mean, y_std, dropout)
+    finetune.save_finetune(head, out_dir, model, ft_mean, ft_std, label_column, label_index, freeze, bottleneck, y_mean, y_std, dropout)
     (out_dir / "base_model.json").write_text(
         json.dumps({"base_model_dir": str(Path(model_dir).resolve())}, ensure_ascii=False),
         encoding="utf-8",
@@ -457,6 +496,9 @@ def run_finetune(
         (out_dir / "preprocess.json").write_text(
             json.dumps(preprocess, ensure_ascii=False), encoding="utf-8"
         )
+    # 保存 MSC 参考光谱，预测时复用（跨批一致性）
+    if msc_ref is not None:
+        np.save(out_dir / "msc_ref.npy", msc_ref)
 
     # 保存评估指标，便于后续分析
     (out_dir / "metrics.json").write_text(
@@ -553,7 +595,7 @@ def run_finetune_predict(
 
     device = get_device()
     _log(f"设备: {device}")
-    encoder, head, meta, mean, std = finetune.load_finetune(model_dir)
+    encoder, head, meta, _, _ = finetune.load_finetune(model_dir)
     encoder.to(device)
     head.to(device)
 
@@ -571,11 +613,16 @@ def run_finetune_predict(
     pp_file = Path(model_dir) / "preprocess.json"
     if pp_file.exists():
         preprocess = json.loads(pp_file.read_text(encoding="utf-8"))
-        X = apply_preprocessing(X, preprocess)
+        msc_ref = None
+        if preprocess.get("msc"):
+            ref_file = Path(model_dir) / "msc_ref.npy"
+            if ref_file.exists():
+                msc_ref = np.load(ref_file)
+        X = apply_preprocessing(X, preprocess, msc_ref=msc_ref)
         used = ", ".join(k for k, v in preprocess.items() if v)
         _log(f"已应用预处理: {used or '无'}")
 
-    Xs = (X - mean) / (std + 1e-8)
+    Xs, _, _ = standardize(X)
     preds = finetune.predict_finetune(
         encoder, head, Xs, device,
         y_mean=meta.get("y_mean"), y_std=meta.get("y_std"),
@@ -594,7 +641,8 @@ def run_finetune_predict(
         scatters = {"y_true": yt.tolist(), "y_pred": pt.tolist()}
         _log(
             f"评估: RMSE={metrics['rmse']:.4f}, MAE={metrics['mae']:.4f}, "
-            f"R²={metrics['r2']:.4f}, corr={metrics['corr']:.4f}, MAPE={metrics['mape']:.2f}%"
+            f"R²={metrics['r2']:.4f}, corr={metrics['corr']:.4f}, MAPE={metrics['mape']:.2f}%, "
+            f"±0.5度内 {metrics['within_0p5']:.1%}, ±1度内 {metrics['within_1p0']:.1%}"
         )
 
     out_df = (
@@ -609,11 +657,18 @@ def run_finetune_predict(
         out_df["error"] = preds - y_true
     if out_path:
         out_path = Path(out_path)
+        out_dir = out_path.parent
     else:
-        PREDICT_DIR.mkdir(parents=True, exist_ok=True)
-        out_path = PREDICT_DIR / f"{datetime.now():%Y%m%d_%H%M%S}_finetune.csv"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_dir = PREDICT_DIR / f"{datetime.now():%Y%m%d_%H%M%S}_finetune"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / "predictions.csv"
+    out_dir.mkdir(parents=True, exist_ok=True)
     out_df.to_csv(out_path, index=False, encoding="utf-8-sig")
+    # 若有真实标签评估，把汇总指标（含 ±0.5 度 / ±1 度内准确度）一并保存到预测目录
+    if metrics:
+        (out_dir / "metrics.json").write_text(
+            json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
 
     _log(f"预测完成，结果已保存: {out_path.resolve()}")
     return {
@@ -623,6 +678,7 @@ def run_finetune_predict(
         "min": float(preds.min()),
         "max": float(preds.max()),
         "out_path": str(out_path.resolve()),
+        "out_dir": str(out_dir.resolve()),
         "label_name": label_name,
         "metrics": metrics,
         "scatters": scatters,
